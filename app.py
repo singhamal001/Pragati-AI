@@ -54,6 +54,9 @@ AI_PERSONAS = {
     """,
     "SUMMARIZER": """
     You are a data analysis AI. The following is a conversation with a new user. Your sole task is to read the entire conversation and generate a JSON object summarizing the user's profile. The JSON should have three keys: "interests" (a list of strings), "goals" (a list of strings), and "challenges" (a list of strings). Output ONLY the raw JSON object and nothing else.
+    """,
+    "NARRATIVE_SUMMARIZER": """
+    You are an expert summarization AI. Read the following conversation with a new user and generate a concise, one-paragraph summary (under 150 words) that captures the user's background, primary goals, and key challenges mentioned. This summary will be used as a quick human-readable reference. Respond with ONLY the paragraph summary and nothing else.
     """
 }
 
@@ -311,12 +314,15 @@ Based on the conversation, provide your next response as the assistant.
         else:
             self.speak("I'm sorry, I didn't understand that command.")
 
+    # app.py -> inside the App class
+
     def summarize_and_conclude_onboarding(self):
-        """Fetches history, gets summary from LLM, and updates the database."""
+        """Fetches history, gets a JSON and a paragraph summary from the LLM, and updates the database."""
         final_history = db.get_conversation_history(self.current_user['id'])
         history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in final_history])
         
-        summarizer_prompt = f"""
+        # --- 1. Get the Structured JSON Summary ---
+        json_summarizer_prompt = f"""
         [INST]
         {AI_PERSONAS['SUMMARIZER']}
 
@@ -326,23 +332,43 @@ Based on the conversation, provide your next response as the assistant.
         """
         
         self.update_status("Creating profile summary...")
-        json_summary_str = self._process_gemma_response(summarizer_prompt)
+        json_summary_str = self._process_gemma_response(json_summarizer_prompt, max_tokens=500)
         
+        # --- 2. Get the Narrative Paragraph Summary ---
+        narrative_summarizer_prompt = f"""
+        [INST]
+        {AI_PERSONAS['NARRATIVE_SUMMARIZER']}
+
+        CONVERSATION HISTORY:
+        {history_text}
+        [/INST]
+        """
+        self.update_status("Creating narrative summary...")
+        # Use a slightly larger token limit for the paragraph
+        paragraph_summary_str = self._process_gemma_response(narrative_summarizer_prompt, max_tokens=250)
+        
+        # --- 3. Save Both to the Database ---
         try:
             if json_summary_str.startswith("```json"):
                 json_summary_str = json_summary_str[7:]
                 if json_summary_str.endswith("```"):
                     json_summary_str = json_summary_str[:-3]
             
-            profile_summary = json.loads(json_summary_str)
+            profile_summary_json = json.loads(json_summary_str)
+            
             updated_prefs = self.current_user['preferences']
             updated_prefs['onboarding_complete'] = True
-            updated_prefs['profile_summary'] = profile_summary
+            updated_prefs['profile_summary'] = profile_summary_json # The JSON object
+            updated_prefs['narrative_summary'] = paragraph_summary_str.strip() # The paragraph text
+            
             db.update_user_preferences(self.current_user['id'], updated_prefs)
-            print("Successfully saved profile summary:", profile_summary)
+            print("Successfully saved structured and narrative summaries.")
+            print("Narrative Summary:", paragraph_summary_str)
+
         except json.JSONDecodeError as e:
             print(f"Error: LLM did not return valid JSON for summary. Error: {e}")
             print(f"Received: {json_summary_str}")
+            # Still save onboarding as complete even if summary fails
             updated_prefs = self.current_user['preferences']
             updated_prefs['onboarding_complete'] = True
             db.update_user_preferences(self.current_user['id'], updated_prefs)
