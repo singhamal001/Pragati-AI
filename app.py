@@ -168,19 +168,26 @@ class App(ctk.CTk):
         
         try:
             with self.microphone as source:
-                audio_data = self.recognizer.listen(source)
+                audio_data = self.recognizer.listen(source, timeout=None, phrase_time_limit=15)
+                
             self.update_status("Transcribing...")
             wav_data = audio_data.get_wav_data()
             temp_audio_path = Path("temp_audio.wav")
             with open(temp_audio_path, "wb") as f: f.write(wav_data)
+            
             result = self.whisper_model.transcribe(str(temp_audio_path), fp16=False)
             user_input = result['text'].strip()
             os.remove(temp_audio_path)
 
-            self.update_transcript(user_input)
+            if user_input:
+                self.update_transcript(user_input)
+            
             return user_input
+            
         except sr.UnknownValueError:
-            self.speak("I'm sorry, I didn't catch that. Let's try again.")
+            self.speak("I'm sorry, I couldn't make out what you said. Let's try again.")
+            return ""
+        except sr.WaitTimeoutError:
             return ""
         except Exception as e:
             print(f"An error occurred during listening: {e}")
