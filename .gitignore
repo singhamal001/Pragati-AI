@@ -3,3 +3,6 @@ dist/
 *.wav
 *.gguf
 *.pyc
+VoiceNavigator/
+*.safetensors
+indri-0.1-124m-tts/
