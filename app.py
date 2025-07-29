@@ -15,6 +15,13 @@ import numpy as np
 from pydub import AudioSegment
 from pydub.playback import play
 
+import prompts
+import gemma_logic
+import interview_analyzer
+import data_storage
+
+import interview_flow_manager
+
 import database_manager as db
 from ui_components import WelcomeFrame, AdminDashboard, MainAppFrame
 
@@ -76,6 +83,8 @@ class App(ctk.CTk):
         self.current_frame = None
         self.conversation_history = []
         self.current_persona = None
+        self.listener_stop_flag = None
+        self.interview_in_progress = False
 
         self.whisper_model, self.gemma_model = None, None
         self.piper_voice = None
@@ -85,10 +94,24 @@ class App(ctk.CTk):
 
         self.show_welcome_screen()
 
+    def _clear_chat_ui(self):
+        for widget in self.current_frame.chat_history_frame.winfo_children():
+            widget.destroy()
+
+    def _add_message_to_chat_ui(self, role, text):
+        if role == "assistant":
+            label = ctk.CTkLabel(self.current_frame.chat_history_frame, text=text, wraplength=600, justify="left", anchor="w")
+            label.pack(anchor="w", padx=10, pady=5)
+        else:
+            label = ctk.CTkLabel(self.current_frame.chat_history_frame, text=text, wraplength=600, justify="right", anchor="e", text_color="#24a0ed")
+            label.pack(anchor="e", padx=10, pady=5)
+        
+        self.after(100, self.current_frame.chat_history_frame._parent_canvas.yview_moveto, 1.0)
+
     def show_frame(self, frame_class, **kwargs):
         if self.current_frame:
             self.current_frame.grid_forget()
-        self.current_frame = frame_class(self, **kwargs)
+        self.current_frame = frame_class(master=self, **kwargs)
         self.current_frame.grid(row=0, column=0, sticky="nsew")
 
     def show_welcome_screen(self):
@@ -127,9 +150,19 @@ class App(ctk.CTk):
                 self.app_state = "NAVIGATION"
                 self.current_persona = "NAVIGATION_ASSISTANT"
                 welcome_message = f"Welcome back, {self.current_user['username']}!"
+                
                 last_screen = self.current_user['preferences'].get('last_screen', 'interview_screen')
-                self.current_frame.show_screen(last_screen)
-                threading.Thread(target=self.initialize_models_and_listen, args=(welcome_message,)).start()
+                if self.current_frame:
+                    self.current_frame.show_screen(last_screen)
+
+                def post_load_task():
+                    self.listener_stop_flag = threading.Event()
+                    threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
+                    
+                    self.speak(welcome_message)
+                    self.update_status("Ready for commands.")
+
+                threading.Thread(target=lambda: (self._load_models(), post_load_task()), daemon=True).start()
 
     def speak(self, text):
         """Synthesizes and plays audio, ensuring it completes fully."""
@@ -138,9 +171,9 @@ class App(ctk.CTk):
         
         def audio_task():
             try:
+                self.update_status("Speaking...")
                 samplerate = self.piper_voice.config.sample_rate
                 with sd.OutputStream(samplerate=samplerate, channels=1, dtype='int16') as stream:
-                    self.update_status("Speaking...")
                     for audio_chunk in self.piper_voice.synthesize(text):
                         stream.write(audio_chunk.audio_int16_array)
             except Exception as e:
@@ -159,40 +192,65 @@ class App(ctk.CTk):
         except Exception as e:
             print(f"Error playing audio file {path}: {e}")
 
+
     def listen_after_prompt(self, prompt_text=""):
+        """
+        Plays a prompt, then enters a dedicated loop to wait for and record a user's full answer.
+        This function now contains ALL the important timing settings to prevent interruptions.
+        """
         if prompt_text:
             self.speak(prompt_text)
-        
+
+        # --- Let's define our timing parameters clearly here ---
+        pause_duration = 1.5  
+        max_record_time = 300
+        initial_timeout = 30
+
+        # --- For your visibility, let's print the settings we're using ---
+        print(f"DEBUG: Listener settings: pause_threshold={pause_duration}s, phrase_limit={max_record_time}s")
+        # --------------------------------------------------------------------
+
         self.play_audio_file(BEEP_SOUND_PATH)
         self.update_status("Listening...")
-        
-        try:
-            with self.microphone as source:
-                audio_data = self.recognizer.listen(source, timeout=None, phrase_time_limit=15)
-                
-            self.update_status("Transcribing...")
-            wav_data = audio_data.get_wav_data()
-            temp_audio_path = Path("temp_audio.wav")
-            with open(temp_audio_path, "wb") as f: f.write(wav_data)
-            
-            result = self.whisper_model.transcribe(str(temp_audio_path), fp16=False)
-            user_input = result['text'].strip()
-            os.remove(temp_audio_path)
 
-            if user_input:
-                self.update_transcript(user_input)
-            
-            return user_input
-            
-        except sr.UnknownValueError:
-            self.speak("I'm sorry, I couldn't make out what you said. Let's try again.")
-            return ""
-        except sr.WaitTimeoutError:
-            return ""
-        except Exception as e:
-            print(f"An error occurred during listening: {e}")
-            self.speak("Sorry, an error occurred while trying to listen.")
-            return ""
+        while True:
+            try:
+                self.recognizer.pause_threshold = pause_duration
+
+                with self.microphone as source:
+                    audio_data = self.recognizer.listen(
+                        source,
+                        timeout=initial_timeout,
+                        phrase_time_limit=max_record_time
+                    )
+
+                self.update_status("Transcribing...")
+                wav_data = audio_data.get_wav_data()
+                temp_audio_path = Path("temp_audio.wav")
+                with open(temp_audio_path, "wb") as f:
+                    f.write(wav_data)
+
+                result = self.whisper_model.transcribe(str(temp_audio_path), fp16=False)
+                user_input = result['text'].strip()
+                os.remove(temp_audio_path)
+
+                if user_input:
+                    self.update_transcript(user_input)
+                    return user_input
+                else:
+                    self.update_status("Listening...")
+                    continue
+
+            except sr.WaitTimeoutError:
+                self.update_status("Listening...")
+                continue
+            except sr.UnknownValueError:
+                self.update_status("Listening...")
+                continue
+            except Exception as e:
+                print(f"An unexpected error occurred during listening: {e}")
+                self.speak("Sorry, an error occurred with the microphone.")
+                return ""
 
     def _load_models(self):
         if not self.whisper_model:
@@ -220,8 +278,12 @@ class App(ctk.CTk):
         self.background_listener()
 
     def update_status(self, text):
+        """
+        Thread-safe method to update the status label.
+        It uses self.after() to schedule the UI update on the main thread.
+        """
         if isinstance(self.current_frame, MainAppFrame):
-            self.current_frame.audio_status_label.configure(text=text)
+            self.after(0, self.current_frame.audio_status_label.configure, {"text": text})
     
     def update_transcript(self, text):
         """Safely updates the transcript label from any thread."""
@@ -248,15 +310,15 @@ class App(ctk.CTk):
 
             history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.conversation_history])
             prompt_for_gemma = f"""
-[INST]
-{AI_PERSONAS[self.current_persona]}
+            [INST]
+            {AI_PERSONAS[self.current_persona]}
 
-Here is the conversation so far:
-{history_str}
+            Here is the conversation so far:
+            {history_str}
 
-Based on the conversation, provide your next response as the assistant.
-[/INST]
-"""
+            Based on the conversation, provide your next response as the assistant.
+            [/INST]
+            """
             
             self.update_status("Gemma is thinking...")
             ai_response = self._process_gemma_response(prompt_for_gemma)
@@ -272,28 +334,175 @@ Based on the conversation, provide your next response as the assistant.
             if not user_input:
                 user_input = "..."
     
-    def background_listener(self):
-        """Listens for stateless navigation commands with the new, robust prompt."""
+    def background_listener(self, stop_event):
+        """
+        Listens for navigation commands in a dedicated, stoppable thread.
+
+        This function contains its own listening logic and does NOT call the
+        shared 'listen_after_prompt' function to avoid resource conflicts.
+        """
+        print("DEBUG: Background listener thread started.")
         with self.microphone as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
+
+        while not stop_event.is_set():
+            try:
+                with self.microphone as source:
+                    audio_data = self.recognizer.listen(source, timeout=1.5, phrase_time_limit=10)
+
+                self.update_status("Transcribing command...")
+                wav_data = audio_data.get_wav_data()
+                temp_audio_path = Path("temp_audio.wav")
+                with open(temp_audio_path, "wb") as f:
+                    f.write(wav_data)
+
+                result = self.whisper_model.transcribe(str(temp_audio_path), fp16=False)
+                user_text = result['text'].strip()
+                os.remove(temp_audio_path)
+
+                if user_text:
+                    self.update_transcript(user_text)
+                    self.update_status(f"Heard: '{user_text}'\n\nThinking...")
+
+                    prompt = f"""[INST]
+                    {AI_PERSONAS['NAVIGATION_ASSISTANT']}
+
+                    User Request: "{user_text}"
+
+                    Command:
+                    [/INST]"""
+
+                    command = self._process_gemma_response(prompt, max_tokens=30)
+                    print(f"DEBUG: Cleaned command from Gemma: '{command}'")
+                    self.execute_command(command)
+                
+                self.update_status("Ready for commands.")
+
+            except sr.WaitTimeoutError:
+                continue
+            except sr.UnknownValueError:
+                continue
+            except Exception as e:
+                print(f"An error occurred in background_listener: {e}")
+                import time
+                time.sleep(1)
+
+        print("DEBUG: Background listener thread has successfully stopped.")
+
+    def start_interview_session(self, interview_type):
+        if self.interview_in_progress:
+            return
+
+        self._clear_chat_ui()
+
+        if self.listener_stop_flag:
+            self.listener_stop_flag.set()
+
+        self.interview_in_progress = True
+        threading.Thread(target=self._interview_thread, args=(interview_type,), daemon=True).start()
+
+
+    def _interview_thread(self, interview_type):
+        """Manages the entire interview flow, from start to analysis."""
         
-        while self.app_state == "NAVIGATION":
-            user_text = self.listen_after_prompt()
+        # --- Setup Phase ---
+        # 1. Set a LONG pause threshold suitable for interview answers
+        self.recognizer.pause_threshold = 2.5
+        print(f"DEBUG: Mic pause_threshold set to {self.recognizer.pause_threshold} for interview.")
+
+        self.after(0, lambda: self.current_frame.background_button.configure(state="disabled"))
+        self.after(0, lambda: self.current_frame.salary_button.configure(state="disabled"))
+        
+        self.update_status(f"Starting {interview_type} Interview...")
+        self.speak(f"Okay, let's begin the {interview_type} interview.")
+
+        interview_history = []
+        prompt_template = prompts.BACKGROUND_INTERVIEW_PROMPT if interview_type == "Background" else prompts.SALARY_NEGOTIATION_PROMPT
+        
+        turn_count = 0
+        
+        # --- Using a 'while True' loop managed by our flow controller ---
+        while True:
+            turn_count += 1
+            print(f"\n--- Turn {turn_count} ---")
+
+            ai_response = gemma_logic.get_interview_response(self.gemma_model, self._process_gemma_response, interview_history, prompt_template)
             
-            if user_text:
-                self.update_status(f"Heard: '{user_text}'\n\nThinking...")
+            # Sanitize response from potential markdown
+            if ai_response.startswith("```"):
+                ai_response = ai_response.strip("` \n")
 
-                prompt = f"""[INST]
-                {AI_PERSONAS['NAVIGATION_ASSISTANT']}
+            if not ai_response: # Handle case where model returns empty string
+                print("WARNING: Model returned empty response. Attempting to conclude.")
+                self.speak("It seems we've reached a good stopping point. Thank you for your time.")
+                break
 
-                User Request: "{user_text}"
+            print(f"AI: {ai_response}")
+            self.after(0, self._add_message_to_chat_ui, "assistant", ai_response)
+            interview_history.append({"role": "assistant", "content": ai_response})
+            
+            # Check for natural conclusion phrases from the AI
+            conclusion_phrases = ["thank you for your time", "we'll be in touch", "end the simulation", "conclude our discussion"]
+            if any(phrase in ai_response.lower() for phrase in conclusion_phrases):
+                self.speak(ai_response)
+                print("INFO: Interview concluded by AI's closing statement.")
+                break
 
-                Command:
-                [/INST]"""
+            user_answer = self.listen_after_prompt(prompt_text=ai_response)
+            print(f"USER: {user_answer if user_answer else '<No input detected>'}")
 
-                command = self._process_gemma_response(prompt, max_tokens=30)
-                print(f"DEBUG: Cleaned command from Gemma: '{command}'")
-                self.execute_command(command)
+            if not user_answer:
+                self.speak("I'm sorry, I didn't get that. We can try that question again.")
+                interview_history.pop() # Remove the last AI question
+                turn_count -= 1 # Don't count this as a turn
+                continue
+            
+            self.after(0, self._add_message_to_chat_ui, "user", user_answer)
+            interview_history.append({"role": "user", "content": user_answer})
+            
+            # --- USE THE FLOW MANAGER TO CHECK IF WE SHOULD END ---
+            should_end, reason = interview_flow_manager.should_end_interview(interview_history, interview_type, turn_count)
+            if should_end:
+                print(f"INFO: Ending interview. Reason: {reason}")
+                self.speak("Okay, that seems like a good place to stop. Thank you.")
+                break
+
+            if turn_count >= 12: # Final safety break
+                print("INFO: Ending interview due to reaching max turn limit.")
+                self.speak("We've covered a lot today, so let's wrap up there. Thank you.")
+                break
+
+        # --- Analysis Phase (This part remains the same) ---
+        self.update_status("Interview finished. Analyzing...")
+        self.speak("The interview is now complete. I'm analyzing your responses now...")
+        
+        analysis_results = interview_analyzer.run_full_analysis(
+            self.gemma_model, self._process_gemma_response, interview_history, interview_type
+        )
+        if analysis_results:
+            data_storage.save_report_to_csv(analysis_results)
+            self.speak("Great session! Your detailed feedback report has been saved.")
+        else:
+            self.speak("There was an issue generating the analysis, so no report was saved.")
+
+        # --- Teardown Phase ---
+        # 2. Restore the SHORT pause threshold for command listening
+        self.recognizer.pause_threshold = 1.0 
+        print(f"DEBUG: Mic pause_threshold restored to {self.recognizer.pause_threshold} for commands.")
+
+        self.after(0, lambda: self.current_frame.background_button.configure(state="normal"))
+        self.after(0, lambda: self.current_frame.salary_button.configure(state="normal"))
+        
+        self.app_state = "NAVIGATION"
+        self.update_status("Ready for commands.")
+        print(f"DEBUG: App state changed back to {self.app_state}. Restarting background listener.")
+        
+        self.interview_in_progress = False
+
+        # This is now the ONLY call to restart the listener. It is correct.
+        self.listener_stop_flag = threading.Event()
+        threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
+
 
     def execute_command(self, command: str):
         """Handles navigation, special, and help commands."""
@@ -324,11 +533,10 @@ Based on the conversation, provide your next response as the assistant.
     # app.py -> inside the App class
 
     def summarize_and_conclude_onboarding(self):
-        """Fetches history, gets a JSON and a paragraph summary from the LLM, and updates the database."""
+        """Fetches history, gets summaries, and correctly restarts the listener."""
         final_history = db.get_conversation_history(self.current_user['id'])
         history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in final_history])
         
-        # --- 1. Get the Structured JSON Summary ---
         json_summarizer_prompt = f"""
         [INST]
         {AI_PERSONAS['SUMMARIZER']}
@@ -337,11 +545,9 @@ Based on the conversation, provide your next response as the assistant.
         {history_text}
         [/INST]
         """
-        
         self.update_status("Creating profile summary...")
         json_summary_str = self._process_gemma_response(json_summarizer_prompt, max_tokens=500)
         
-        # --- 2. Get the Narrative Paragraph Summary ---
         narrative_summarizer_prompt = f"""
         [INST]
         {AI_PERSONAS['NARRATIVE_SUMMARIZER']}
@@ -351,31 +557,22 @@ Based on the conversation, provide your next response as the assistant.
         [/INST]
         """
         self.update_status("Creating narrative summary...")
-        # Use a slightly larger token limit for the paragraph
         paragraph_summary_str = self._process_gemma_response(narrative_summarizer_prompt, max_tokens=250)
         
-        # --- 3. Save Both to the Database ---
         try:
             if json_summary_str.startswith("```json"):
                 json_summary_str = json_summary_str[7:]
                 if json_summary_str.endswith("```"):
                     json_summary_str = json_summary_str[:-3]
-            
             profile_summary_json = json.loads(json_summary_str)
-            
             updated_prefs = self.current_user['preferences']
             updated_prefs['onboarding_complete'] = True
-            updated_prefs['profile_summary'] = profile_summary_json # The JSON object
-            updated_prefs['narrative_summary'] = paragraph_summary_str.strip() # The paragraph text
-            
+            updated_prefs['profile_summary'] = profile_summary_json
+            updated_prefs['narrative_summary'] = paragraph_summary_str.strip()
             db.update_user_preferences(self.current_user['id'], updated_prefs)
             print("Successfully saved structured and narrative summaries.")
-            print("Narrative Summary:", paragraph_summary_str)
-
         except json.JSONDecodeError as e:
             print(f"Error: LLM did not return valid JSON for summary. Error: {e}")
-            print(f"Received: {json_summary_str}")
-            # Still save onboarding as complete even if summary fails
             updated_prefs = self.current_user['preferences']
             updated_prefs['onboarding_complete'] = True
             db.update_user_preferences(self.current_user['id'], updated_prefs)
@@ -383,9 +580,10 @@ Based on the conversation, provide your next response as the assistant.
         self.app_state = "NAVIGATION"
         self.current_persona = "NAVIGATION_ASSISTANT"
         self.update_status("Profile setup complete!")
-        self.speak("Your profile is now set up. From now on, I'll be your navigation assistant. Just tell me which screen you'd like to go to.")
+        self.speak("Your profile is now set up. From now on, I'll be your navigation assistant.")
         
-        self.background_listener()
+        self.listener_stop_flag = threading.Event()
+        threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
 
 if __name__ == "__main__":
     print("Application starting up...")

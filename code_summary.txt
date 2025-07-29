@@ -1,0 +1,2159 @@
+# Python Code Summary
+# Directory: X:\gemma3n-hackathon
+# Total files: 18
+# Generated for LLM processing
+
+================================================================================
+
+## File 1/18: app.py
+**Full path:** X:\gemma3n-hackathon\app.py
+
+```python
+# app.py
+
+import customtkinter as ctk
+import threading
+import speech_recognition as sr
+import whisper
+from llama_cpp import Llama
+import os
+from pathlib import Path
+import json
+
+from piper.voice import PiperVoice
+import sounddevice as sd
+import numpy as np
+from pydub import AudioSegment
+from pydub.playback import play
+
+import database_manager as db
+from ui_components import WelcomeFrame, AdminDashboard, MainAppFrame
+
+# --- Constants ---
+MODEL_PATH = "./model/gemma-3n-e2b-it.Q2_K_M.gguf"
+PIPER_MODEL_PATH = "./model/en_US-hfc_female-medium.onnx"
+BEEP_SOUND_PATH = "./assets/beep.wav"
+ONBOARDING_AUDIO_FILES = [
+    "./assets/instructions_part1.wav",
+    "./assets/instructions_part2.wav",
+]
+
+# --- AI Personas ---
+AI_PERSONAS = {
+    "ONBOARDING_SPECIALIST": """
+    You are Gemma, a friendly and empathetic Onboarding Specialist for a new, visually impaired user. Your mission is to conduct a short, welcoming interview to personalize their experience. The user has already received instructions.
+    Your process has two steps:
+    1. INTERVIEW: Ask 2-3 open-ended, exploratory questions to understand the user. Good topics include their hobbies, what they are most excited to use this application for, or what a perfect digital assistant would do for them.
+    2. CONCLUDE: After you have asked your questions and received answers, you must end the conversation. To do this, your final response and ONLY your final response must be the special command: [END_ONBOARDING].
+    """,
+    "NAVIGATION_ASSISTANT": """
+    You are an expert command processing AI. Your only job is to analyze the user's transcribed text and determine which of the following commands to issue. Respond with ONLY the single, most appropriate command name and nothing else.
+
+    **Available Commands:**
+    - 'GOTO_INTERVIEW_SCREEN'
+    - 'GOTO_FEEDBACK_SCREEN'
+    - 'EXPLAIN_INSTRUCTIONS'
+    - 'UNKNOWN_COMMAND'
+
+    **Examples of User Intent Mapping:**
+    - User says: "I think I'm ready to give some mock interviews" -> Correct Command: 'GOTO_INTERVIEW_SCREEN'
+    - User says: "let's start a practice session" -> Correct Command: 'GOTO_INTERVIEW_SCREEN'
+    - User says: "I want to know about my past performance" -> Correct Command: 'GOTO_FEEDBACK_SCREEN'
+    - User says: "can you show me my progress?" -> Correct Command: 'GOTO_FEEDBACK_SCREEN'
+    - User says: "help" or "what can I do here?" -> Correct Command: 'EXPLAIN_INSTRUCTIONS'
+    - User says: "what is the weather like today?" -> Correct Command: 'UNKNOWN_COMMAND'
+    """,
+    "SUMMARIZER": """
+    You are a data analysis AI. The following is a conversation with a new user. Your sole task is to read the entire conversation and generate a JSON object summarizing the user's profile. The JSON should have three keys: "interests" (a list of strings), "goals" (a list of strings), and "challenges" (a list of strings). Output ONLY the raw JSON object and nothing else.
+    """
+}
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("AI Interview Coach")
+        self.geometry("800x600")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.app_state = None
+        self.current_user = None
+        self.current_frame = None
+        self.conversation_history = []
+        self.current_persona = None
+
+        self.whisper_model, self.gemma_model = None, None
+        self.piper_voice = None
+        self.recognizer = sr.Recognizer()
+        self.recognizer.pause_threshold = 1.5
+        self.microphone = sr.Microphone()
+
+        self.show_welcome_screen()
+
+    def show_frame(self, frame_class, **kwargs):
+        if self.current_frame:
+            self.current_frame.grid_forget()
+        self.current_frame = frame_class(self, **kwargs)
+        self.current_frame.grid(row=0, column=0, sticky="nsew")
+
+    def show_welcome_screen(self):
+        self.show_frame(WelcomeFrame, login_callback=self.login_user)
+
+    def login_user(self, username):
+        user_data = db.get_user_by_username(username)
+        if user_data:
+            self.current_user = user_data
+            self.current_user['preferences'] = json.loads(self.current_user['preferences'])
+            self.conversation_history = db.get_conversation_history(self.current_user['id'])
+            self.transition_to_main_app()
+
+    def logout_and_return_to_welcome(self):
+        self.app_state = None
+        self.current_user = None
+        self.conversation_history = []
+        self.title("AI Interview Coach")
+        self.show_welcome_screen()
+        self.current_frame.populate_profile_buttons()
+
+    def transition_to_main_app(self):
+        if self.current_user['role'] == 'admin':
+            self.title("Admin Dashboard")
+            self.show_frame(AdminDashboard, switch_profile_callback=self.logout_and_return_to_welcome)
+        else:
+            self.title(f"User: {self.current_user['username']}")
+            self.show_frame(MainAppFrame)
+            
+            onboarding_complete = self.current_user['preferences'].get('onboarding_complete', False)
+            if not onboarding_complete:
+                self.app_state = "ONBOARDING"
+                self.current_persona = "ONBOARDING_SPECIALIST"
+                threading.Thread(target=self.initialize_models_and_start_onboarding, daemon=True).start()
+            else:
+                self.app_state = "NAVIGATION"
+                self.current_persona = "NAVIGATION_ASSISTANT"
+                welcome_message = f"Welcome back, {self.current_user['username']}!"
+                last_screen = self.current_user['preferences'].get('last_screen', 'interview_screen')
+                self.current_frame.show_screen(last_screen)
+                threading.Thread(target=self.initialize_models_and_listen, args=(welcome_message,)).start()
+
+    def speak(self, text):
+        """Synthesizes and plays audio, ensuring it completes fully."""
+        if not self.piper_voice or not text or not text.strip():
+            return
+        
+        def audio_task():
+            try:
+                samplerate = self.piper_voice.config.sample_rate
+                with sd.OutputStream(samplerate=samplerate, channels=1, dtype='int16') as stream:
+                    self.update_status("Speaking...")
+                    for audio_chunk in self.piper_voice.synthesize(text):
+                        stream.write(audio_chunk.audio_int16_array)
+            except Exception as e:
+                print(f"Piper TTS playback error: {e}")
+        
+        audio_thread = threading.Thread(target=audio_task)
+        audio_thread.start()
+        audio_thread.join()
+
+    def play_audio_file(self, path):
+        try:
+            sound = AudioSegment.from_wav(path)
+            play(sound)
+        except FileNotFoundError:
+            print(f"Warning: Audio file not found at {path}")
+        except Exception as e:
+            print(f"Error playing audio file {path}: {e}")
+
+    def listen_after_prompt(self, prompt_text=""):
+        if prompt_text:
+            self.speak(prompt_text)
+        
+        self.play_audio_file(BEEP_SOUND_PATH)
+        self.update_status("Listening...")
+        
+        try:
+            with self.microphone as source:
+                audio_data = self.recognizer.listen(source)
+            self.update_status("Transcribing...")
+            wav_data = audio_data.get_wav_data()
+            temp_audio_path = Path("temp_audio.wav")
+            with open(temp_audio_path, "wb") as f: f.write(wav_data)
+            result = self.whisper_model.transcribe(str(temp_audio_path), fp16=False)
+            user_input = result['text'].strip()
+            os.remove(temp_audio_path)
+
+            self.update_transcript(user_input)
+            return user_input
+        except sr.UnknownValueError:
+            self.speak("I'm sorry, I didn't catch that. Let's try again.")
+            return ""
+        except Exception as e:
+            print(f"An error occurred during listening: {e}")
+            self.speak("Sorry, an error occurred while trying to listen.")
+            return ""
+
+    def _load_models(self):
+        if not self.whisper_model:
+            self.update_status("Loading speech model...")
+            self.whisper_model = whisper.load_model("base.en")
+        if not self.gemma_model:
+            self.update_status("Loading Gemma AI...")
+            self.gemma_model = Llama(model_path=MODEL_PATH, n_ctx=2048, verbose=False)
+        if not self.piper_voice:
+            self.update_status("Loading voice model...")
+            self.piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+
+    def initialize_models_and_start_onboarding(self):
+        self._load_models()
+        self.update_status("Please listen to the instructions.")
+        for path in ONBOARDING_AUDIO_FILES:
+            self.play_audio_file(path)
+        self.onboarding_listener()
+
+    def initialize_models_and_listen(self, welcome_message=""):
+        self._load_models()
+        if welcome_message:
+            self.speak(welcome_message)
+        self.update_status("Ready for commands.")
+        self.background_listener()
+
+    def update_status(self, text):
+        if isinstance(self.current_frame, MainAppFrame):
+            self.current_frame.audio_status_label.configure(text=text)
+    
+    def update_transcript(self, text):
+        """Safely updates the transcript label from any thread."""
+        if isinstance(self.current_frame, MainAppFrame):
+            self.after(0, lambda: self.current_frame.transcript_label.configure(text=f'You said: "{text}"'))
+
+    def _process_gemma_response(self, full_prompt, max_tokens=150):
+        """
+        Takes a fully formatted prompt string and sends it to the LLM.
+        """
+        output = self.gemma_model(full_prompt, max_tokens=max_tokens, stop=["</s>", "[INST]", "User:", "Assistant:"], echo=False)
+        return output['choices'][0]['text'].strip()
+
+    def onboarding_listener(self):
+        """Manages the conversational onboarding flow with correct prompt formatting."""
+        with self.microphone as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+
+        user_input = "" 
+        while self.app_state == "ONBOARDING":
+            if user_input:
+                self.conversation_history.append({"role": "user", "content": user_input})
+                db.add_message_to_history(self.current_user['id'], "user", user_input)
+
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.conversation_history])
+            prompt_for_gemma = f"""
+[INST]
+{AI_PERSONAS[self.current_persona]}
+
+Here is the conversation so far:
+{history_str}
+
+Based on the conversation, provide your next response as the assistant.
+[/INST]
+"""
+            
+            self.update_status("Gemma is thinking...")
+            ai_response = self._process_gemma_response(prompt_for_gemma)
+
+            if "[END_ONBOARDING]" in ai_response:
+                self.execute_command("[END_ONBOARDING]")
+                break
+
+            self.conversation_history.append({"role": "assistant", "content": ai_response})
+            db.add_message_to_history(self.current_user['id'], "assistant", ai_response)
+            
+            user_input = self.listen_after_prompt(prompt_text=ai_response)
+            if not user_input:
+                user_input = "..."
+    
+    def background_listener(self):
+        """Listens for stateless navigation commands with the new, robust prompt."""
+        with self.microphone as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+        
+        while self.app_state == "NAVIGATION":
+            user_text = self.listen_after_prompt()
+            
+            if user_text:
+                self.update_status(f"Heard: '{user_text}'\n\nThinking...")
+
+                prompt = f"""[INST]
+                {AI_PERSONAS['NAVIGATION_ASSISTANT']}
+
+                User Request: "{user_text}"
+
+                Command:
+                [/INST]"""
+
+                command = self._process_gemma_response(prompt, max_tokens=30)
+                print(f"DEBUG: Cleaned command from Gemma: '{command}'")
+                self.execute_command(command)
+
+    def execute_command(self, command: str):
+        """Handles navigation, special, and help commands."""
+        clean_command = command.strip().strip("'\"")
+
+        if clean_command == "[END_ONBOARDING]":
+            self.update_status("Finalizing your profile...")
+            self.speak("Thank you. One moment while I set up your profile.")
+            threading.Thread(target=self.summarize_and_conclude_onboarding, daemon=True).start()
+            return
+        
+        self.update_status(f"Command: {clean_command}")
+        
+        if clean_command == "GOTO_INTERVIEW_SCREEN":
+            self.speak("Okay, showing the Interview Screen.")
+            if isinstance(self.current_frame, MainAppFrame):
+                self.current_frame.show_screen("interview_screen")
+        elif clean_command == "GOTO_FEEDBACK_SCREEN":
+            self.speak("Okay, showing the Feedback Screen.")
+            if isinstance(self.current_frame, MainAppFrame):
+                self.current_frame.show_screen("feedback_screen")
+        elif clean_command == "EXPLAIN_INSTRUCTIONS":
+            self.speak("Of course. Here are the instructions again.")
+            self.play_audio_file(ONBOARDING_AUDIO_FILES[1])
+        else:
+            self.speak("I'm sorry, I didn't understand that command.")
+
+    def summarize_and_conclude_onboarding(self):
+        """Fetches history, gets summary from LLM, and updates the database."""
+        final_history = db.get_conversation_history(self.current_user['id'])
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in final_history])
+        
+        summarizer_prompt = f"""
+        [INST]
+        {AI_PERSONAS['SUMMARIZER']}
+
+        CONVERSATION HISTORY:
+        {history_text}
+        [/INST]
+        """
+        
+        self.update_status("Creating profile summary...")
+        json_summary_str = self._process_gemma_response(summarizer_prompt)
+        
+        try:
+            if json_summary_str.startswith("```json"):
+                json_summary_str = json_summary_str[7:]
+                if json_summary_str.endswith("```"):
+                    json_summary_str = json_summary_str[:-3]
+            
+            profile_summary = json.loads(json_summary_str)
+            updated_prefs = self.current_user['preferences']
+            updated_prefs['onboarding_complete'] = True
+            updated_prefs['profile_summary'] = profile_summary
+            db.update_user_preferences(self.current_user['id'], updated_prefs)
+            print("Successfully saved profile summary:", profile_summary)
+        except json.JSONDecodeError as e:
+            print(f"Error: LLM did not return valid JSON for summary. Error: {e}")
+            print(f"Received: {json_summary_str}")
+            updated_prefs = self.current_user['preferences']
+            updated_prefs['onboarding_complete'] = True
+            db.update_user_preferences(self.current_user['id'], updated_prefs)
+
+        self.app_state = "NAVIGATION"
+        self.current_persona = "NAVIGATION_ASSISTANT"
+        self.update_status("Profile setup complete!")
+        self.speak("Your profile is now set up. From now on, I'll be your navigation assistant. Just tell me which screen you'd like to go to.")
+        
+        self.background_listener()
+
+if __name__ == "__main__":
+    print("Application starting up...")
+    db.initialize_database()
+    app = App()
+    app.mainloop()
+```
+
+--------------------------------------------------------------------------------
+
+## File 2/18: database_manager.py
+**Full path:** X:\gemma3n-hackathon\database_manager.py
+
+```python
+# database_manager.py
+
+import sqlite3
+import json
+from datetime import datetime
+
+DB_FILE = "profiles.db"
+
+def initialize_database():
+    """Initializes the database and creates tables if they don't exist."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                role TEXT NOT NULL,
+                age INTEGER NOT NULL, 
+                preferences TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        """)
+        cursor.execute("SELECT COUNT(*) FROM users")
+        if cursor.fetchone()[0] == 0:
+            print("No users found. Creating default Admin profile...")
+            # MODIFIED: Default screen is now the interview screen
+            admin_preferences = json.dumps({
+                "last_screen": "interview_screen",
+                "onboarding_complete": True 
+            })
+            cursor.execute(
+                "INSERT INTO users (username, role, age, preferences) VALUES (?, ?, ?, ?)",
+                ("Admin", "admin", 99, admin_preferences)
+            )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error during initialization: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def get_all_users():
+    """Fetches all users from the database."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, role, age FROM users")
+        users = [dict(row) for row in cursor.fetchall()]
+        return users
+    except sqlite3.Error as e:
+        print(f"Database error fetching users: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_user_by_username(username):
+    """Fetches a single user's complete data by their username."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        user_data = cursor.fetchone()
+        if user_data:
+            return dict(user_data)
+        return None
+    except sqlite3.Error as e:
+        print(f"Database error fetching user {username}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def add_user(name, age):
+    """Adds a new user to the database with onboarding set to false."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        # MODIFIED: Default screen is now the interview screen
+        new_user_prefs = json.dumps({
+            "last_screen": "interview_screen",
+            "onboarding_complete": False,
+            "profile_summary": {}
+        })
+        cursor.execute(
+            "INSERT INTO users (username, role, age, preferences) VALUES (?, ?, ?, ?)",
+            (name, "user", int(age), new_user_prefs)
+        )
+        conn.commit()
+        return True, f"Success: User '{name}' added."
+    except sqlite3.IntegrityError:
+        return False, f"Error: Username '{name}' already exists."
+    except sqlite3.Error as e:
+        return False, f"Database Error: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+def remove_user(user_id):
+    """Removes a user and their entire conversation history."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM conversation_history WHERE user_id = ?", (user_id,))
+        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        return True, "Success: User and their history removed."
+    except sqlite3.Error as e:
+        return False, f"Database Error: {e}"
+    finally:
+        if conn:
+            conn.close()
+
+def add_message_to_history(user_id, role, content):
+    """Adds a single message to the conversation history table."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO conversation_history (user_id, role, content) VALUES (?, ?, ?)",
+            (user_id, role, content)
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error adding message: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def get_conversation_history(user_id):
+    """Retrieves and formats the entire conversation for a user."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, content FROM conversation_history WHERE user_id = ? ORDER BY timestamp ASC",
+            (user_id,)
+        )
+        history = [{"role": row[0], "content": row[1]} for row in cursor.fetchall()]
+        return history
+    except sqlite3.Error as e:
+        print(f"Database error getting history: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def update_user_preferences(user_id, new_preferences):
+    """Updates the preferences JSON for a specific user."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        preferences_json = json.dumps(new_preferences)
+        cursor.execute(
+            "UPDATE users SET preferences = ? WHERE id = ?",
+            (preferences_json, user_id)
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error updating preferences: {e}")
+    finally:
+        if conn:
+            conn.close()
+```
+
+--------------------------------------------------------------------------------
+
+## File 3/18: generate_audio.py
+**Full path:** X:\gemma3n-hackathon\generate_audio.py
+
+```python
+# generate_audio.py
+
+import argparse
+import wave
+import os
+from piper.voice import PiperVoice
+import numpy as np # Ensure numpy is imported
+
+# --- Configuration ---
+PIPER_MODEL_PATH = "./model/en_US-hfc_female-medium.onnx"
+OUTPUT_DIR = "./assets"
+
+def generate_audio(text_to_speak: str, output_filename: str):
+    """
+    Generates a WAV file from text using Piper TTS.
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    if not output_filename.lower().endswith('.wav'):
+        output_filename += '.wav'
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+    print("Loading Piper voice model...")
+    try:
+        voice = PiperVoice.load(PIPER_MODEL_PATH)
+    except Exception as e:
+        print(f"Error: Could not load the Piper model from '{PIPER_MODEL_PATH}'")
+        print(f"Details: {e}")
+        return
+
+    print(f"Synthesizing audio for: '{text_to_speak}'")
+    
+    with wave.open(output_path, 'wb') as wav_file:
+        # Set the parameters for the WAV file
+        wav_file.setnchannels(1)  # Mono audio
+        wav_file.setsampwidth(2)  # 16-bit audio
+        wav_file.setframerate(voice.config.sample_rate)
+        
+        # Synthesize the audio and write the raw bytes to the file
+        for chunk in voice.synthesize(text_to_speak):
+            # --- THIS IS THE CRITICAL FIX ---
+            # Convert the numpy array of audio samples to raw bytes
+            wav_file.writeframes(chunk.audio_int16_array.tobytes())
+
+    print("-" * 50)
+    print(f"Successfully generated audio file at: {output_path}")
+    print("-" * 50)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Generate a WAV audio file from text using Piper TTS."
+    )
+    parser.add_argument(
+        "text",
+        type=str,
+        help="The text to be converted to speech, enclosed in quotes."
+    )
+    parser.add_argument(
+        "filename",
+        type=str,
+        help="The desired name for the output WAV file (e.g., 'my_audio.wav')."
+    )
+    args = parser.parse_args()
+    generate_audio(args.text, args.filename)
+```
+
+--------------------------------------------------------------------------------
+
+## File 4/18: manasvi-code\gemma-interviewer\audio_processing.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\audio_processing.py
+
+```python
+# import sounddevice as sd
+# import numpy as np
+# import speech_recognition as sr
+
+# def speak(text, piper_voice):
+#     """
+#     Converts text to speech using the loaded Piper TTS model.
+#     Takes the loaded piper_voice object as an argument.
+#     """
+#     print(f"\n< Gemma: {text}")
+#     if not piper_voice or not text or not text.strip():
+#         return
+
+#     try:
+#         print("Synthesizing audio...")
+#         audio_generator = piper_voice.synthesize(text)
+#         audio_arrays = [chunk.audio_int16_array for chunk in audio_generator]
+#         audio_data = np.concatenate(audio_arrays)
+#         sd.play(audio_data, samplerate=piper_voice.config.sample_rate)
+#         sd.wait()
+#     except Exception as e:
+#         print(f"An error occurred during TTS playback: {e}")
+
+# def listen(recognizer, microphone, transcriber):
+#     """
+#     Listens for a user's response, transcribes it, and returns the text.
+#     Takes initialized recognizer, microphone, and transcriber objects as arguments.
+#     """
+#     with microphone as source:
+#         print("Listening for your answer...")
+#         try:
+#             recognizer.adjust_for_ambient_noise(source, duration=0.5)
+#             audio_data = recognizer.listen(source)
+#             print("Processing your answer...")
+#             wav_bytes = audio_data.get_wav_data()
+#             user_answer = transcriber(wav_bytes)["text"].strip()
+            
+#             if user_answer:
+#                 print(f"> You said: {user_answer}")
+#                 return user_answer
+#             else:
+#                 speak("I'm sorry, I didn't catch that. Could you please repeat your answer?", None) # Pass None for piper_voice to avoid error
+#                 return None
+
+#         except sr.UnknownValueError:
+#             speak("I couldn't understand that. Let's try again.", None)
+#             return None
+
+import sounddevice as sd
+import numpy as np
+import speech_recognition as sr
+import time  # Import the time module to calculate duration
+
+def speak(text, piper_voice):
+    """
+    Converts text to speech using the loaded Piper TTS model.
+    Takes the loaded piper_voice object as an argument.
+    """
+    print(f"\n< Gemma: {text}")
+    if not piper_voice or not text or not text.strip():
+        return
+
+    try:
+        print("Synthesizing audio...")
+        audio_generator = piper_voice.synthesize(text)
+        audio_arrays = [chunk.audio_int16_array for chunk in audio_generator]
+        audio_data = np.concatenate(audio_arrays)
+        sd.play(audio_data, samplerate=piper_voice.config.sample_rate)
+        sd.wait()
+    except Exception as e:
+        print(f"An error occurred during TTS playback: {e}")
+
+def listen(recognizer, microphone, transcriber, piper_voice):
+    """
+    Listens for a user's response, transcribes it, and returns both
+    the text and the duration of the speech in seconds.
+    """
+    with microphone as source:
+        print("Listening for your answer...")
+        try:
+            recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            
+            # --- Start timer before listening ---
+            start_time = time.time()
+            
+            audio_data = recognizer.listen(source)
+            
+            # --- End timer after listening is complete ---
+            end_time = time.time()
+            duration = end_time - start_time
+            
+            print("Processing your answer...")
+            wav_bytes = audio_data.get_wav_data()
+            user_answer = transcriber(wav_bytes)["text"].strip()
+            
+            if user_answer:
+                print(f"> You said: {user_answer}")
+                # --- Return both values ---
+                return user_answer, duration
+            else:
+                # If listening fails, speak an error and return None for both values
+                speak("I'm sorry, I didn't catch that. Could you please repeat?", piper_voice)
+                return None, 0
+
+        except sr.UnknownValueError:
+            speak("I couldn't understand that. Let's try again.", piper_voice)
+            # --- Return two values to prevent crashing ---
+            return None, 0
+        except Exception as e:
+            print(f"An unexpected error occurred during listening: {e}")
+            return None, 0
+        
+```
+
+--------------------------------------------------------------------------------
+
+## File 5/18: manasvi-code\gemma-interviewer\config.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\config.py
+
+```python
+# --- Model and Path Configurations ---
+WHISPER_MODEL_NAME = "openai/whisper-base.en"
+PIPER_MODEL_PATH = './model/en_US-hfc_female-medium.onnx'
+GEMMA_MODEL_NAME = 'hf.co/unsloth/gemma-3n-E2B-it-GGUF:Q2_K_XL'
+# GEMMA_MODEL_NAME = 'gemma3n:e4b'
+
+# --- Hardware and Performance ---
+# Use "cuda" if you have a compatible NVIDIA GPU, otherwise "cpu"
+DEVICE = "cpu"
+
+# --- Interview Flow Control ---
+MAX_QUESTIONS = 3  # The interview will have an intro + this many questions
+
+# --- Audio Processing Settings ---
+MIC_SAMPLE_RATE = 16000
+PAUSE_THRESHOLD = 4.0 # Seconds of silence to end a user's turn
+
+FILLER_WORDS = {
+    'um', 'uh', 'er', 'ah', 'like', 'so', 'you know', 'i mean', 'actually',
+    'basically', 'literally', 'well', 'right', 'okay', 'hmm', 'mhm'
+}
+
+MAX_COUNTER_OFFERS = 2
+```
+
+--------------------------------------------------------------------------------
+
+## File 6/18: manasvi-code\gemma-interviewer\data_models.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\data_models.py
+
+```python
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional
+import uuid
+from datetime import datetime
+
+class InterviewDataRow(BaseModel):
+    """Defines and validates the schema for a single row in our feedback CSV."""
+    interview_id: uuid.UUID
+    timestamp: datetime
+    interview_type: str
+    question_number: int
+    question_text: str
+    answer_text: str
+    wpm: int
+    star_score: Optional[int] = None
+    star_reason: Optional[str] = None
+    keywords_score: Optional[int] = None
+    keywords_reason: Optional[str] = None
+    professionalism_score: Optional[int] = None
+    professionalism_reason: Optional[str] = None
+
+    @field_validator('*', mode='before')
+    def empty_str_to_none(cls, v):
+        if isinstance(v, str) and v.strip() == '':
+            return None
+        return v
+```
+
+--------------------------------------------------------------------------------
+
+## File 7/18: manasvi-code\gemma-interviewer\data_storage.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\data_storage.py
+
+```python
+import csv
+import os
+from data_models import InterviewDataRow
+
+CSV_FILE = 'feedback_reports.csv'
+
+def save_report_to_csv(pydantic_rows: list[InterviewDataRow]):
+    if not pydantic_rows:
+        print("No validated data rows to save.")
+        return
+
+    headers = list(InterviewDataRow.model_fields.keys())
+    file_exists = os.path.isfile(CSV_FILE)
+    
+    with open(CSV_FILE, 'a', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=headers)
+        if not file_exists:
+            writer.writeheader()
+        
+        for row_model in pydantic_rows:
+            writer.writerow(row_model.model_dump(mode='json'))
+            
+    print(f"Report saved to {CSV_FILE} with Interview ID: {pydantic_rows[0].interview_id}")
+```
+
+--------------------------------------------------------------------------------
+
+## File 8/18: manasvi-code\gemma-interviewer\feedback_analyzer.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\feedback_analyzer.py
+
+```python
+import pandas as pd
+from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
+from langchain_community.llms import Ollama
+import config
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+def handle_feedback_request(user_query: str):
+    try:
+        df = pd.read_csv('feedback_reports.csv')
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    except FileNotFoundError:
+        return "It looks like you don't have any saved feedback reports yet. Please complete an interview first."
+    except Exception as e:
+        return f"I had trouble reading your feedback file. Error: {e}"
+
+    llm = Ollama(model=config.GEMMA_MODEL_NAME)
+
+    agent = create_pandas_dataframe_agent(
+        llm=llm,
+        df=df,
+        agent_type="zero-shot-react-description",
+        verbose=True,
+        handle_parsing_errors=True,
+        allow_dangerous_code=True
+    )
+
+    agent_prompt = f"""
+    You are an expert data analyst and career coach.
+    A pandas DataFrame named `df` has ALREADY been loaded into memory for you.
+    DO NOT try to load any CSV files. Use the existing `df` DataFrame.
+
+    Your task is to answer the user's question based on the data in `df`.
+    The columns are: {df.columns.tolist()}
+
+    Here is your thought process:
+    1.  Analyze the User's Question: Understand exactly what they are asking for.
+    2.  Plan your Python Code: Think step-by-step about how to filter and manipulate the `df` to get the information you need.
+    3.  Execute the Code: Use the `python_repl_ast` tool to run your pandas code.
+    4.  Observe the Result: Look at the output of your code.
+    5.  Synthesize the Final Answer: Based on your observation, formulate a complete, conversational, and helpful answer in plain English. DO NOT just output the raw data or a table. Explain the findings.
+
+    The user's question is: "{user_query}"
+    """
+    try:
+        response = agent.invoke({"input": agent_prompt})
+        return response['output']
+    except Exception as e:
+        return f"I encountered an error while analyzing the data. Please try a simpler query. Error: {e}"
+```
+
+--------------------------------------------------------------------------------
+
+## File 9/18: manasvi-code\gemma-interviewer\gemma_logic.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\gemma_logic.py
+
+```python
+# gemma_logic.py
+import ollama
+import prompts
+import re
+
+def get_orchestrator_decision(user_command, model_name):
+    prompt = prompts.ORCHESTRATOR_PROMPT.format(user_command=user_command)
+    return get_simple_response(prompt, model_name).strip().upper()
+
+def get_interview_response(conversation_history, model_name, prompt_template):
+    """
+    Gets the next response for ANY ongoing interview using the specified prompt template.
+    This single function now handles both HR and Background interviews.
+    """
+    print(">> Gemma is thinking...")
+    
+    # Format the chosen prompt with the current state of the interview
+    prompt = prompt_template.format(
+        history=format_history_for_prompt(conversation_history)
+    )
+    
+    # We use get_simple_response to execute the call
+    return get_simple_response(prompt, model_name)
+
+def generate_final_feedback_report(analysis_summary, model_name):
+    prompt = prompts.FINAL_SUMMARY_PROMPT.format(analysis_summary=analysis_summary)
+    return get_simple_response(prompt, model_name)
+
+def get_simple_response(prompt, model_name):
+    messages = [{'role': 'user', 'content': prompt}]
+    try:
+        response = ollama.chat(model=model_name, messages=messages)
+        return response['message']['content']
+    except Exception as e:
+        print(f"Error communicating with Gemma: {e}")
+        return "I seem to be having trouble thinking right now. Please try again."
+
+def format_history_for_prompt(history):
+    if not history: return "The conversation has not started yet."
+    formatted_string = ""
+    for message in history:
+        role = "You (The Candidate)" if message['role'] == 'user' else "Gemma (The Interviewer)"
+        formatted_string += f"{role}:\n{message['content']}\n\n"
+    return formatted_string
+
+def get_feedback_decision(user_query, model_name):
+    """Uses the LLM to parse a user's feedback request into a structured command."""
+    prompt = prompts.FEEDBACK_ORCHESTRATOR_PROMPT.format(user_query=user_query)
+    
+    raw_response = get_simple_response(prompt, model_name)
+    
+    # --- Parse the structured response ---
+    try:
+        parts = [part.strip() for part in raw_response.split(',')]
+        if len(parts) == 3:
+            function_name = parts[0]
+            interview_type = parts[1]
+            n = int(parts[2])
+            # Basic validation
+            if function_name in ['get_nth_last_report', 'get_comparison_report'] and interview_type in ['Background', 'HR & Salary']:
+                return {"function": function_name, "type": interview_type, "n": n}
+    except (ValueError, IndexError) as e:
+        print(f"Error parsing feedback decision: {e}. Raw response: '{raw_response}'")
+    
+    # Return None if parsing fails
+    return None
+```
+
+--------------------------------------------------------------------------------
+
+## File 10/18: manasvi-code\gemma-interviewer\interview_analyzer.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\interview_analyzer.py
+
+```python
+import ollama
+import config
+import prompts
+from data_models import InterviewDataRow
+from datetime import datetime
+import uuid
+
+def calculate_vocal_metrics(text, duration):
+    word_count = len(text.split())
+    wpm = (word_count / duration) * 60 if duration > 0 else 0
+    # Filler count logic is now removed.
+    return {"wpm": round(wpm)}
+
+def analyze_content_with_gemma(question, answer, model_name):
+    print(f"Analyzing answer for question: '{question}'")
+    prompt = prompts.CONTENT_ANALYSIS_PROMPT.format(question=question, answer=answer)
+    messages = [{'role': 'user', 'content': prompt}]
+    try:
+        response = ollama.chat(model=model_name, messages=messages)
+        analysis = {}
+        for line in response['message']['content'].split('\n'):
+            if ':' in line:
+                key, value = line.split(':', 1)
+                clean_key = key.strip().lower().replace(" ", "_").strip('\'"')
+                analysis[clean_key] = value.strip()
+        return analysis
+    except Exception as e:
+        print(f"Error during content analysis: {e}")
+        return {}
+
+def run_full_analysis(conversation_history, model_name, interview_type):
+    print("\n--- Starting Post-Interview Analysis ---")
+    validated_rows = []
+    questions = [msg['content'] for msg in conversation_history if msg['role'] == 'assistant']
+    answers = [{'text': msg['content'], 'duration': msg['duration']} for msg in conversation_history if msg['role'] == 'user']
+    
+    interview_id = uuid.uuid4()
+    timestamp = datetime.now()
+
+    for i, answer_data in enumerate(answers):
+        if i >= len(questions): break
+        
+        question = questions[i]
+        answer_text = answer_data['text']
+        answer_duration = answer_data['duration']
+        
+        vocal_metrics = calculate_vocal_metrics(answer_text, answer_duration)
+        content_analysis = analyze_content_with_gemma(question, answer_text, model_name)
+        
+        full_data = {
+            "interview_id": interview_id, "timestamp": timestamp, "interview_type": interview_type,
+            "question_number": i + 1, "question_text": question, "answer_text": answer_text,
+            **vocal_metrics, **content_analysis
+        }
+        
+        try:
+            validated_row = InterviewDataRow(**full_data)
+            validated_rows.append(validated_row)
+        except Exception as e:
+            print(f"--- Data Validation Error for question {i+1}: {e} ---")
+            continue
+            
+    return validated_rows
+```
+
+--------------------------------------------------------------------------------
+
+## File 11/18: manasvi-code\gemma-interviewer\interview_flow_manager.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\interview_flow_manager.py
+
+```python
+# interview_flow_manager.py
+from gemma_logic import get_simple_response, format_history_for_prompt
+import prompts
+
+def get_topics_from_llm(conversation_history, model_name):
+    """Uses the LLM to intelligently extract topics from the last user response."""
+    last_user_answer = ""
+    for msg in reversed(conversation_history):
+        if msg['role'] == 'user':
+            last_user_answer = msg['content']
+            break
+    if not last_user_answer: return set()
+
+    prompt = prompts.TOPIC_EXTRACTION_PROMPT.format(last_user_answer=last_user_answer)
+    try:
+        response = get_simple_response(prompt, model_name)
+        if "none" in response.lower(): return set()
+        return set(topic.strip() for topic in response.split(','))
+    except Exception as e:
+        print(f"Error extracting topics: {e}")
+        return set()
+
+def should_end_interview(conversation_history, interview_type, current_turn, min_turns, topics_covered):
+    if current_turn < min_turns:
+        return False, "Minimum turns not reached"
+    if has_natural_conclusion_indicators(conversation_history):
+        return True, "Natural conclusion detected"
+    
+    if interview_type == "HR & Salary":
+        return should_end_hr_specific(conversation_history)
+    else:
+        return should_end_background_specific(conversation_history, topics_covered, current_turn)
+
+def should_end_hr_specific(conversation_history):
+    recent_messages = [msg['content'].lower() for msg in conversation_history[-4:]]
+    indicators = ["final offer", "best offer", "budget constraints", "we'll be in touch"]
+    for message in recent_messages:
+        if any(indicator in message for indicator in indicators):
+            return True, "Salary negotiation completed"
+    return False, "Negotiation ongoing"
+
+def should_end_background_specific(conversation_history, topics_covered, current_turn):
+    expected_topics = {"project", "experience", "technical", "challenge", "team", "leadership"}
+    coverage = len(topics_covered.intersection(expected_topics)) / len(expected_topics)
+    
+    if coverage >= 0.6 and current_turn >= 7:
+        return True, "Sufficient topics covered"
+    if is_conversation_stagnating(conversation_history):
+        return True, "Conversation stagnating"
+    if current_turn >= 10:
+        return True, "Extensive discussion completed"
+    return False, "More discussion needed"
+
+def is_conversation_stagnating(conversation_history):
+    if len(conversation_history) < 6: return False
+    assistant_msgs = [msg['content'] for msg in conversation_history[-6:] if msg['role'] == 'assistant']
+    if len(assistant_msgs) < 2: return False
+    
+    msg1_words = set(assistant_msgs[-2].lower().split())
+    msg2_words = set(assistant_msgs[-1].lower().split())
+    if not msg1_words or not msg2_words: return False
+    
+    if len(msg1_words.intersection(msg2_words)) / len(msg1_words) > 0.7:
+        return True
+    return False
+
+def has_natural_conclusion_indicators(conversation_history):
+    if len(conversation_history) < 2: return False
+    recent_messages = [msg['content'].lower() for msg in conversation_history[-3:]]
+    phrases = ["thank you for your time", "that covers everything", "no more questions", "we'll be in touch"]
+    return any(any(phrase in message for phrase in phrases) for message in recent_messages)
+
+def generate_interview_conclusion(conversation_history, interview_type, model_name):
+    prompt = prompts.GENERATE_CONCLUSION_PROMPT.format(
+        interview_type=interview_type,
+        history=format_history_for_prompt(conversation_history)
+    )
+    return get_simple_response(prompt, model_name)
+```
+
+--------------------------------------------------------------------------------
+
+## File 12/18: manasvi-code\gemma-interviewer\main.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\main.py
+
+```python
+import sys
+import random
+from transformers import pipeline
+from piper.voice import PiperVoice
+import speech_recognition as sr
+import numpy as np
+import pandas as pd
+
+# Import all custom modules
+import config
+import prompts
+from audio_processing import speak, listen
+from gemma_logic import get_orchestrator_decision, get_interview_response, generate_final_feedback_report, get_simple_response, get_feedback_decision
+from interview_analyzer import run_full_analysis
+from data_storage import save_report_to_csv
+from report_generator import get_nth_last_interview_report, get_comparison_report
+
+def initialize_models():
+    """Loads and initializes all the necessary models. Exits on failure."""
+    print("--- Initializing Models ---")
+    try:
+        transcriber = pipeline("automatic-speech-recognition", model=config.WHISPER_MODEL_NAME, device=config.DEVICE, return_timestamps=True)
+        piper_voice = PiperVoice.load(config.PIPER_MODEL_PATH)
+        recognizer = sr.Recognizer()
+        recognizer.pause_threshold = config.PAUSE_THRESHOLD
+        microphone = sr.Microphone(sample_rate=config.MIC_SAMPLE_RATE)
+        print("--- All models initialized successfully! ---")
+        return transcriber, piper_voice, recognizer, microphone
+    except Exception as e:
+        print(f"FATAL ERROR during model initialization: {e}")
+        sys.exit()
+
+def run_interview(transcriber, piper_voice, recognizer, microphone, interview_type):
+    """A robust interview function that relies on the stateful LLM prompt to guide the conversation."""
+    conversation_history = []
+    prompt_template = prompts.SALARY_NEGOTIATION_PROMPT if interview_type == "Salary Negotiation" else prompts.BACKGROUND_INTERVIEW_PROMPT
+    print(f"--- Starting {interview_type} interview ---")
+
+    for _ in range(15): # Safety net of 15 turns
+        gemma_response = get_interview_response(conversation_history, config.GEMMA_MODEL_NAME, prompt_template)
+        conversation_history.append({'role': 'assistant', 'content': gemma_response})
+        speak(gemma_response, piper_voice)
+
+        conclusion_phrases = ["thank you for your time", "we'll be in touch", "end the simulation", "conclude our discussion"]
+        if any(phrase in gemma_response.lower() for phrase in conclusion_phrases):
+            print("--- Interview concluded naturally by Gemma ---")
+            break
+
+        user_answer, duration = listen(recognizer, microphone, transcriber, piper_voice)
+        if not user_answer:
+            speak("I didn't quite catch that, let's try that again.", piper_voice)
+            conversation_history.pop()
+            continue
+        
+        conversation_history.append({'role': 'user', 'content': user_answer, 'duration': duration})
+    else:
+        print("--- Ending interview: Maximum turns reached ---")
+        speak("We've covered a lot of ground, so let's wrap up there. Thank you for your time.", piper_voice)
+
+    print(f"\n--- {interview_type} Interview Finished. Generating feedback... ---")
+    analysis_results = run_full_analysis(conversation_history, config.GEMMA_MODEL_NAME, interview_type)
+    save_report_to_csv(analysis_results)
+    
+    if analysis_results:
+        analysis_summary = ""
+        for item in analysis_results:
+            analysis_summary += (f"For the question about '{item.question_text[:40]}...', your STAR score was {item.star_score} because '{item.star_reason}'. Your Professionalism score was {item.professionalism_score} because '{item.professionalism_reason}'.\n")
+    else:
+        analysis_summary = "No analysis data was generated for this interview."
+    
+    speak("Your interview data has been saved. Would you like to hear your feedback report now?", piper_voice)
+    # Use the fast, simple confirmation for this predictable question
+    if listen_for_simple_confirmation(recognizer, microphone, transcriber, piper_voice):
+        final_spoken_report = generate_final_feedback_report(analysis_summary, config.GEMMA_MODEL_NAME)
+        speak(final_spoken_report, piper_voice)
+    else:
+        speak("Okay. You can ask for a feedback report from the main menu later.", piper_voice)
+
+def handle_feedback_mode(recognizer, microphone, transcriber, piper_voice):
+    """Handles the feedback interaction with a clear, guided menu."""
+    menu_text = """
+    Of course. I can provide several types of reports. Please say the option you would like:
+    1. A detailed summary of your most recent Salary negotiation interview.
+    2. A comparison of your last 3 Background interviews.
+    3. A comparison of your last 3 Salary Negotiation sessions.
+    4. A report on your 3rd last Background interview.
+    """
+    speak(menu_text, piper_voice)
+    
+    # Give the user up to 3 chances to select a valid option
+    for _ in range(3):
+        choice_text, _ = listen(recognizer, microphone, transcriber, piper_voice)
+        if not choice_text:
+            speak("I'm sorry, I didn't get that. Please say the number of the option you'd like.", piper_voice)
+            continue
+
+        # Use the intelligent router to understand the choice
+        decision = get_feedback_decision(choice_text, config.GEMMA_MODEL_NAME)
+        
+        if decision:
+            speak(f"Understood. Analyzing your records. Please wait.", piper_voice)
+            
+            # Load the dataframe once, only when needed
+            try:
+                df = pd.read_csv('feedback_reports.csv')
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            except FileNotFoundError:
+                speak("It looks like you don't have any saved feedback reports yet.", piper_voice)
+                return
+
+            if decision['function'] == 'get_nth_last_report':
+                report = get_nth_last_interview_report(df, config.GEMMA_MODEL_NAME, decision['type'], decision['n'])
+            elif decision['function'] == 'get_comparison_report':
+                report = get_comparison_report(df, config.GEMMA_MODEL_NAME, decision['type'], decision['n'])
+            else:
+                report = "I understood the command, but there was an error executing it."
+            
+            speak(report, piper_voice)
+            return # Exit successfully
+
+        else:
+            speak("I'm sorry, I didn't understand that option.", piper_voice)
+
+    speak("I'm having trouble understanding. Let's return to the main menu.", piper_voice)
+
+def listen_for_simple_confirmation(recognizer, microphone, transcriber, piper_voice):
+    """A fast, simple, keyword-based function to listen for a 'yes' or 'no' response."""
+    print("Waiting for simple confirmation (yes/no)...")
+    response, _ = listen(recognizer, microphone, transcriber, piper_voice)
+    if response and "yes" in response.lower():
+        return True
+    return False
+
+def listen_for_confirmation_llm(recognizer, microphone, transcriber, piper_voice):
+    """Uses the LLM to intelligently determine if a response is a 'yes' or 'no'."""
+    print("Waiting for LLM confirmation...")
+    response_text, _ = listen(recognizer, microphone, transcriber, piper_voice)
+    if not response_text:
+        return None
+
+    prompt = prompts.CONFIRMATION_PROMPT.format(user_response=response_text)
+    decision = get_simple_response(prompt, config.GEMMA_MODEL_NAME)
+
+    if "YES" in decision.upper():
+        return True
+    if "NO" in decision.upper():
+        return False
+    return None
+
+def main():
+    """The main application orchestrator."""
+    transcriber, piper_voice, recognizer, microphone = initialize_models()
+    speak("Hello! I'm Gemma, your interview coach. Please choose: Background Interview, Salary Negotiation Interview or Feedback Report.", piper_voice)
+
+    while True:
+        print("\n--- Waiting for your command ---")
+        command, _ = listen(recognizer, microphone, transcriber, piper_voice)
+        if not command: continue
+
+        intent = get_orchestrator_decision(command, config.GEMMA_MODEL_NAME)
+        
+        confirmed = False
+        if intent in ['BACKGROUND_INTERVIEW', 'SALARY_NEGOTIATION', 'FEEDBACK']:
+            confirmation_prompt = f"I understood that you want to start a {intent.replace('_', ' ').title()}. Is that correct?"
+            speak(confirmation_prompt, piper_voice)
+            # Use the intelligent, flexible LLM confirmation for the main menu
+            confirmation_result = listen_for_confirmation_llm(recognizer, microphone, transcriber, piper_voice)
+            
+            if confirmation_result is True:
+                confirmed = True
+            elif confirmation_result is False:
+                speak("My mistake. Let's try again. What would you like to do?", piper_voice)
+            else:
+                speak("I didn't quite understand your response. Let's try again from the main menu.", piper_voice)
+        elif intent == 'EXIT':
+            confirmed = True
+
+        if not confirmed:
+            continue
+
+        if intent == 'BACKGROUND_INTERVIEW':
+            run_interview(transcriber, piper_voice, recognizer, microphone, "Background")
+        elif intent == 'SALARY_NEGOTIATION':
+            run_interview(transcriber, piper_voice, recognizer, microphone, "Salary Negotiation")
+        elif intent == 'FEEDBACK':
+            handle_feedback_mode(recognizer, microphone, transcriber, piper_voice)
+        elif intent == 'EXIT':
+            speak("Goodbye!", piper_voice)
+            sys.exit()
+        else:
+            speak("I'm sorry, I didn't understand that command.", piper_voice)
+        
+        speak("I'm ready for your next command.", piper_voice)
+
+if __name__ == "__main__":
+    main()
+```
+
+--------------------------------------------------------------------------------
+
+## File 13/18: manasvi-code\gemma-interviewer\model\from piper.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\model\from piper.py
+
+```python
+from piper.voice import PiperVoice
+
+PIPER_MODEL_PATH = './model/en_US-hfc_female-medium.onnx'
+
+print("Loading model...")
+try:
+    voice = PiperVoice.load(PIPER_MODEL_PATH)
+    print("Synthesizing a test sentence...")
+    # Get the generator
+    audio_generator = voice.synthesize("test")
+    
+    # Get the VERY FIRST chunk from the generator
+    first_chunk = next(audio_generator)
+    
+    print("\n--- OBJECT INSPECTION ---")
+    print(f"The object type is: {type(first_chunk)}")
+    print("\nAttributes and methods available in this object:")
+    # Use dir() to list everything inside the object
+    print(dir(first_chunk))
+    print("-------------------------\n")
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+```
+
+--------------------------------------------------------------------------------
+
+## File 14/18: manasvi-code\gemma-interviewer\prompts.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\prompts.py
+
+```python
+# --- Persona Prompts ---
+
+# This is the prompt for the main menu / orchestrator
+ORCHESTRATOR_PROMPT = """
+You are the master controller for an AI Interview Coaching application. The user will give you a command. Your ONLY job is to understand their intent and respond with a single, specific keyword. Do not be conversational.
+
+The user said: "{user_command}"
+
+Based on their command, respond with ONLY one of the following keywords:
+- 'BACKGROUND_INTERVIEW'
+- 'SALARY_NEGOTIATION'  # <-- Renamed from HR_INTERVIEW
+- 'FEEDBACK'
+- 'EXIT'
+"""
+
+BACKGROUND_INTERVIEW_PROMPT = """
+Instruction: You are an expert interviewer named Gemma, conducting a background and project-focused interview. Your persona is friendly, professional, and curious. Your task is to generate ONLY the words Gemma would say out loud.
+
+RULES:
+- Your entire response MUST be a single, conversational block of text.
+- ABSOLUTELY DO NOT include any stage directions, parenthetical notes, or meta-commentary.
+- Ask only one question at a time.
+
+CONVERSATION FLOW & STATE MANAGEMENT:
+1.  **Introduction Stage:** If the conversation is empty, you MUST introduce yourself and ask the candidate to tell you about themselves.
+2.  **Core Interview Stage:** After their introduction, ask thoughtful follow-up questions based on their previous answers.
+3.  **Conclusion Stage:** When you feel the conversation has covered enough ground (after several in-depth questions), you can conclude the interview. Thank them for their time and end on a positive note.
+
+CONTEXT:
+The full conversation history so far is:
+{history}
+
+TASK:
+Based on the rules and the conversation history, provide your next single, natural, and conversational response.
+"""
+
+# NEW, FOCUSED SALARY NEGOTIATION PROMPT
+SALARY_NEGOTIATION_PROMPT = """
+Instruction: You are an expert HR Manager named Gemma, conducting a salary negotiation simulation. Your persona is friendly but firm, representing the company's interests. Your task is to generate ONLY the words Gemma would say out loud.
+
+RULES:
+- Your entire response MUST be a single, conversational block of text.
+- ABSOLUTELY DO NOT include any stage directions or meta-commentary.
+- Ask only one question at a time.
+
+CONVERSATION FLOW & STATE MANAGEMENT:
+1.  **Introduction Stage:** If the conversation is empty, introduce the simulation. For example: "Alright, let's practice a salary negotiation. I'll be the HR manager. To start, based on your skills and the role, what are your salary expectations?"
+2.  **Negotiation Stage:** Once the candidate states their expectation, your goal is to negotiate.
+    - Your first counter-offer MUST be 10-15% lower than their stated number. Justify it with benefits, bonuses, etc.
+    - If they reject your offer, you can make one more slightly higher offer to meet in the middle.
+    - After your second offer, you MUST hold firm and state that it is your best and final offer, citing budget constraints.
+3.  **Conclusion Stage:** After the negotiation is complete, conclude the simulation. For example: "This was a great practice session. We'll now end the simulation."
+
+CONTEXT:
+The full conversation history so far is:
+{history}
+
+TASK:
+Based on the rules and the conversation history, determine the current stage of the negotiation and provide your next single, natural, and conversational response.
+"""
+
+CONTENT_ANALYSIS_PROMPT = """
+Instruction: You are an expert career coach. Analyze the user's answer based on the question they were asked. Provide a structured analysis in a specific format.
+
+RULES:
+- For each metric (STAR, Keywords, Professionalism), provide a score from 1-10.
+- For each metric, you MUST provide a brief, one-sentence justification for the score in the corresponding "_reason" field.
+- For the "Keywords" reason, you MUST list the specific keywords the user mentioned and any key ones they missed.
+- Respond with ONLY the structured data, nothing else.
+
+FORMAT:
+STAR_SCORE: [score]
+STAR_REASON: [justification]
+KEYWORDS_SCORE: [score]
+KEYWORDS_REASON: [justification, including keywords used/missed]
+PROFESSIONALISM_SCORE: [score]
+PROFESSIONALISM_REASON: [justification]
+
+---
+The Question: "{question}"
+The User's Answer: "{answer}"
+"""
+
+FINAL_SUMMARY_PROMPT = """
+Instruction: You are an expert career coach summarizing an interview performance. Write a comprehensive, encouraging, and constructive feedback for the user as if you are having a conversation with them about their performance. 
+Use the structured analysis data provided below to inform your message.
+
+RULES:
+- Your entire response MUST be a single, conversational block of plain text, as if you were speaking directly to the user.
+- ABSOLUTELY DO NOT use any Markdown formatting like lists, bullet points, asterisks (*), hashes (#), or bolding.
+for example ##introduction should not be there, instead it should be introduction; or **introduction** should not be there, instead introduction
+- Be encouraging and focus on actionable insights.
+
+Structure your message with these sections:
+1.  Overall Summary: A brief, encouraging opening statement.
+2.  Vocal Delivery: Comment on the user's pacing (WPM) and use of filler words. Provide actionable advice.
+3.  Content & Structure: Discuss their performance on the STAR method, use of relevant keywords, and professionalism. Highlight strengths and areas for improvement using the provided reasons.
+4.  Concluding Remarks: End with a positive and motivational closing statement.
+5.  Keep it under 200 words
+
+---
+STRUCTURED ANALYSIS DATA:
+{analysis_summary}
+---
+Now, please write the final, user-facing feedback message.
+"""
+
+TOPIC_EXTRACTION_PROMPT = """
+You are a topic analysis model. Your job is to read the user's statement and identify which of the predefined topics are being discussed.
+
+PREDEFINED TOPICS:
+- project
+- technical
+- experience
+- challenge
+- team
+- leadership
+
+RULES:
+- Read the user's statement carefully.
+- Respond with ONLY a comma-separated list of the topics they discussed.
+- If no topics are discussed, respond with "None".
+- Example Response: project, technical, challenge
+
+USER'S STATEMENT:
+"{last_user_answer}"
+"""
+
+# New prompt for generating a conclusion when the interview is force-ended
+GENERATE_CONCLUSION_PROMPT = """
+Based on this {interview_type} interview conversation, generate a brief, natural conclusion 
+that Gemma would say to wrap up the interview professionally. Keep it under 50 words.
+
+Conversation so far:
+{history}
+
+Generate only Gemma's concluding statement:
+"""
+
+FEEDBACK_ORCHESTRATOR_PROMPT = """
+You are a highly intelligent routing agent. Your ONLY job is to analyze the user's request and map it to one of the available functions.
+
+RULES:
+- You MUST determine the correct `function_name`.
+- You MUST determine the `interview_type` ('Background' or 'HR & Salary'). If the user doesn't specify, you can infer from context or default to 'Background'.
+- You MUST determine the number `n` (e.g., for "last 3", n=3; for "latest", n=1).
+- Respond with ONLY a single line in the format: FUNCTION,TYPE,N
+- Do not be conversational. Do not add any other text.
+
+AVAILABLE FUNCTIONS:
+- 'get_nth_last_report'
+- 'get_comparison_report'
+
+---
+Here are some examples:
+
+User Request: "Read my last feedback report."
+Your Response: get_nth_last_report,Background,1
+
+User Request: "A report on my latest background interview."
+Your Response: get_nth_last_report,Background,1
+
+User Request: "Compare my last 3 HR interviews."
+Your Response: get_comparison_report,HR & Salary,3
+
+User Request: "Show me my 2nd last salary negotiation session."
+Your Response: get_nth_last_report,HR & Salary,2
+---
+
+Now, analyze the following user request.
+
+User Request: "{user_query}"
+"""
+
+CONFIRMATION_PROMPT = """
+You are a simple classification agent. Your ONLY job is to determine if the user's response is an affirmation (yes) or a negation (no).
+RULES:
+- If the user is agreeing, confirming, or saying yes, respond with the single word: YES
+- If the user is disagreeing, denying, or saying no, respond with the single word: NO
+- If the user's response is unclear or something else, respond with the single word: UNKNOWN
+User's response: "{user_response}"
+"""
+```
+
+--------------------------------------------------------------------------------
+
+## File 15/18: manasvi-code\gemma-interviewer\report_generator.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\gemma-interviewer\report_generator.py
+
+```python
+import pandas as pd
+from gemma_logic import get_simple_response
+import re
+
+def parse_nth(text):
+    """Helper to find numbers like '3rd', '5', 'fifth' in a string."""
+    text = text.lower()
+    digits = re.findall(r'\d+', text)
+    if digits:
+        return int(digits[0])
+    
+    word_map = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "last": 1, "latest": 1}
+    for word, num in word_map.items():
+        if word in text:
+            return num
+    return None
+
+def handle_feedback_request(user_query, model_name):
+    try:
+        df = pd.read_csv('feedback_reports.csv')
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+    except FileNotFoundError:
+        return "It looks like you don't have any saved feedback reports yet."
+
+    query = user_query.lower()
+    
+    # --- NEW: More robust keyword matching ---
+    interview_type = None
+    if any(word in query for word in ["hr", "salary", "negotiation"]):
+        interview_type = "Salary Negotiation"
+    elif any(word in query for word in ["background", "behavioral", "project"]):
+        interview_type = "Background"
+    
+    # If the type is still unknown, we can't proceed
+    if not interview_type:
+        return "I can provide feedback on 'Background' or 'Salary Negotiation' interviews. Please specify which type you're interested in."
+
+    # Route to the correct function based on keywords
+    if "compare" in query:
+        num_reports = parse_nth(query) or 3 # Default to 3 if not specified
+        return get_comparison_report(df, model_name, interview_type, num_reports)
+    
+    elif "last" in query or "latest" in query or "recent" in query:
+        n = parse_nth(query) or 1
+        return get_nth_last_interview_report(df, model_name, interview_type, n)
+        
+    else:
+        # If the query is specific but doesn't fit a pattern, ask for clarification
+        return f"I understood you're asking about {interview_type} interviews. Could you clarify if you want the 'latest' report or a 'comparison'?"
+
+def get_nth_last_interview_report(df, model_name, interview_type, n):
+    """Gets the Nth last report of a specific type from the provided DataFrame."""
+    print(f"Fetching {n}-th last '{interview_type}' interview...")
+    
+    type_df = df[df['interview_type'] == interview_type]
+    if type_df.empty: return f"I couldn't find any saved '{interview_type}' interviews."
+        
+    unique_interviews = type_df.sort_values('timestamp', ascending=False)['interview_id'].unique()
+    
+    if n > len(unique_interviews): return f"You only have {len(unique_interviews)} saved '{interview_type}' interviews. I can't find the {n}-th last one."
+        
+    target_id = unique_interviews[n - 1]
+    report_data = df[df['interview_id'] == target_id]
+    
+    prompt = f"Summarize the following interview data for the user. This was their {n}-th last {interview_type} interview. Data:\n{report_data.to_string()}"
+    return get_simple_response(prompt, model_name)
+
+def get_comparison_report(df, model_name, interview_type, num_reports):
+    """Compares the last N reports of a specific type from the provided DataFrame."""
+    print(f"Comparing last {num_reports} '{interview_type}' interviews...")
+
+    type_df = df[df['interview_type'] == interview_type]
+    if type_df.empty: return f"I couldn't find any saved '{interview_type}' interviews to compare."
+
+    recent_interviews = type_df.sort_values('timestamp', ascending=False)['interview_id'].unique()[:num_reports]
+    report_data = df[df['interview_id'].isin(recent_interviews)]
+
+    prompt = f"Analyze the user's performance across their last {len(recent_interviews)} '{interview_type}' interviews. Identify trends and improvements. Data:\n{report_data.to_string()}"
+    return get_simple_response(prompt, model_name)
+```
+
+--------------------------------------------------------------------------------
+
+## File 16/18: manasvi-code\voice_assistant.py
+**Full path:** X:\gemma3n-hackathon\manasvi-code\voice_assistant.py
+
+```python
+import speech_recognition as sr
+import torch
+from transformers import pipeline
+import ollama
+import pyttsx3
+
+# --- Configuration ---
+MODEL_NAME = "openai/whisper-base.en"
+
+# --- TTS Engine Initialization ---
+try:
+    tts_engine = pyttsx3.init()
+except Exception as e:
+    print(f"Error initializing TTS engine: {e}")
+    tts_engine = None
+
+# --- Initialization of Whisper ---
+print("Initializing the speech-to-text model...")
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+transcriber = pipeline(
+    "automatic-speech-recognition",
+    model=MODEL_NAME,
+    device=device
+)
+print("Speech-to-text model initialized.")
+
+# --- TTS Function ---
+# def speak(text):
+#     """Converts text to speech."""
+#     print(f"\n< Gemma: {text}")
+#     if tts_engine:
+#         tts_engine.say(text)
+#         tts_engine.runAndWait()
+
+# # --- Corrected Gemma Interaction Function ---
+# def get_gemma_response(text):
+#     """Sends text to the Ollama Gemma model with instructions injected into the user prompt."""
+#     if not text:
+#         return "I didn't catch that. Could you please repeat?"
+        
+#     print(f"\n> You said: {text}")
+#     print(">> Gemma is thinking...")
+    
+#     # --- CORRECTED PROMPT INJECTION ---
+#     # We create a single, detailed prompt string.
+#     full_prompt = f"""
+# Instruction: You are a helpful assistant for a visually impaired user. Your goal is to be clear and concise. Please keep all your answers under 100 words.
+
+# ---
+
+# User's Question: "{text}"
+# """
+    
+#     try:
+#         # We now send this single, combined prompt as the user's content.
+#         response = ollama.chat(
+#             model='gemma3n:e4b',
+#             messages=[
+#                 {
+#                     'role': 'user',
+#                     'content': full_prompt,
+#                 }
+#             ]
+#         )
+#         return response['message']['content']
+#     except Exception as e:
+#         return f"Error communicating with Ollama: {e}"
+
+def speak(text):
+    """
+    Converts text to speech using a new, isolated TTS engine instance
+    for each call to ensure reliability.
+    """
+    # First, print the response so the user sees it immediately.
+    print(f"\n< Gemma: {text}")
+    
+    # --- Defensive Check ---
+    # Don't try to speak if the text is empty or just whitespace.
+    if not text or not text.strip():
+        print("TTS Skipped: No text to speak.")
+        return
+
+    try:
+        # --- Isolated Engine Pattern ---
+        # Initialize a new engine instance every time.
+        tts_engine = pyttsx3.init()
+        
+        # Say the text.
+        tts_engine.say(text)
+        
+        # Block until speaking is complete.
+        tts_engine.runAndWait()
+        
+        # The engine is automatically cleaned up when the function exits.
+        
+    except Exception as e:
+        # If TTS fails for any reason, we print the error but don't crash.
+        print(f"\n--- TTS Engine Error ---")
+        print(f"An error occurred while trying to speak: {e}")
+        print(f"This can sometimes happen due to audio driver conflicts.")
+        print(f"The text response was: {text}")
+        print(f"------------------------")
+
+def get_gemma_response(text):
+    if not text:
+        return "I didn't catch that. Could you please repeat?"
+    print(f"\n> You said: {text}")
+    print(">> Gemma is thinking...")
+    full_prompt = f"""
+Instruction: You are a helpful assistant for a visually impaired user. Your goal is to be clear and concise. Please keep all your answers under 100 words.
+---
+User's Question: "{text}"
+"""
+    try:
+        response = ollama.chat(
+            model='gemma3n:e4b',
+            messages=[{'role': 'user', 'content': full_prompt}]
+        )
+        return response['message']['content']
+    except Exception as e:
+        return f"Error communicating with Ollama: {e}"
+
+
+def main():
+    """Main loop to listen, transcribe, respond, and speak."""
+    
+    r = sr.Recognizer()
+    r.pause_threshold = 4.0
+    mic = sr.Microphone(sample_rate=16000)
+
+    with mic as source:
+        print("\nCalibrating microphone... Please be silent for a moment.")
+        r.adjust_for_ambient_noise(source, duration=1)
+        print("Microphone calibrated.")
+
+    speak("Hello, I am ready. How can I help you?")
+
+    while True:
+        print("\nListening for you to speak...")
+        try:
+            with mic as source:
+                audio_data = r.listen(source)
+
+            print("Processing audio...")
+            wav_bytes = audio_data.get_wav_data()
+            transcribed_text = transcriber(wav_bytes)["text"].strip()
+
+            gemma_answer = get_gemma_response(transcribed_text)
+            
+            speak(gemma_answer)
+
+        except sr.UnknownValueError:
+            speak("I'm sorry, I couldn't understand the audio. Please try again.")
+        except sr.RequestError as e:
+            speak(f"There was a service error; {e}")
+        except KeyboardInterrupt:
+            speak("Goodbye!")
+            break
+
+if __name__ == "__main__":
+    main()
+```
+
+--------------------------------------------------------------------------------
+
+## File 17/18: model\indri-0.1-124m-tts\tts_pipeline.py
+**Full path:** X:\gemma3n-hackathon\model\indri-0.1-124m-tts\tts_pipeline.py
+
+```python
+import re
+import torch
+import numpy as np
+from transformers import MimiModel, GenerationConfig
+from transformers import Pipeline, LogitsProcessor
+
+class AlternatingCodebooksLogitsProcessor(LogitsProcessor):
+    def __init__(self, input_start_len: int, codebook_size: int, num_codebooks: int, offset: int, stop_token: int):
+        self.input_start_len = input_start_len
+        self.codebook_size = codebook_size
+        self.num_codebooks = num_codebooks
+        self.offset = offset
+        self.stop_token = stop_token
+    
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        curr_len = input_ids.shape[-1]
+        codebook_idx = ((curr_len - self.input_start_len) % self.num_codebooks)
+        
+        scores_processed = scores.clone()
+        scores_processed[:, : self.offset + codebook_idx * self.codebook_size] = -float("inf")
+        scores_processed[:, self.offset + (codebook_idx+1) * self.codebook_size :] = -float("inf")
+        scores_processed[:, self.stop_token] = scores[:, self.stop_token]
+
+        return scores_processed
+
+class IndriTTSPipeline(Pipeline):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.audio_tokenizer = MimiModel.from_pretrained('kyutai/mimi').to(device=self.device)
+
+        # TODO: Ideally all of this should come from model config
+        self.convert_token = self.tokenizer.encode('[convert]')
+        self.stop_token = self.tokenizer.encode('[stop]')
+        self.text_modality_token = self.tokenizer.encode('[text]')
+        self.acoustic_modality_token = self.tokenizer.encode('[mimi]')
+        self.num_codebooks = 8
+        self.audio_offset = 50257
+
+        self.model.stop_token = self.stop_token
+
+        self.model.generation_config = GenerationConfig(
+            eos_token_id=self.stop_token,
+            max_length=kwargs.get('max_length', 1024),
+            temperature=kwargs.get('temperature', 0.5),
+            top_k=kwargs.get('top_k', 15),
+            do_sample=kwargs.get('do_sample', True)
+        )
+
+    def _sanitize_parameters(self, **kwargs):
+        speaker = kwargs.get('speaker', '[spkr_unk]')
+
+        preprocess_kwargs = {
+            'speaker': speaker
+        }
+
+        return preprocess_kwargs, {}, {}
+
+    def _prepare_tts_tokens(self, text_tokens, speaker):
+        input_tokens = np.hstack([
+            self.text_modality_token,
+            text_tokens,
+            self.convert_token,
+            self.acoustic_modality_token,
+            self.tokenizer.encode(speaker)
+        ])
+
+        return input_tokens.tolist()
+
+    def _sanitize_text(self, text):
+        text = text.lower()
+        text = re.sub(r'\n+', ' ', text)
+        text = re.sub(r'[ \t]+', ' ', text)
+
+        text = re.sub(r'([,\.?])+', r'\1', text)
+
+        return text.strip()
+
+    def _deserialize_tokens(self, tokens, num_codebooks):
+        cb = [tokens[i::num_codebooks] for i in range(num_codebooks)]
+        min_shape = min([c.shape for c in cb])[0]
+        acoustic_tokens = torch.vstack([c[:min_shape] - 2048*i for i, c in enumerate(cb)])
+
+        return acoustic_tokens
+
+    # TODO: Use this to support batching
+    def _prepare_mimi_batch(self, tokens, attention_mask):
+        max_len = max(token.size(1) for token in tokens)
+
+        padded_tokens = []
+        padded_masks = []
+
+        for token, mask in zip(tokens, attention_masks):
+            pad_len = max_len - token.size(1)
+
+            padded_token = F.pad(token, (0, pad_len, 0, 0), value=0)
+            padded_mask = F.pad(mask, (0, pad_len, 0, 0), value=0)
+
+            padded_tokens.append(padded_token)
+            padded_masks.append(padded_mask)
+
+        stacked_tokens = torch.stack(padded_tokens, dim=0)
+        stacked_masks = torch.stack(padded_masks, dim=0)
+
+        return stacked_tokens, stacked_masks
+
+    def preprocess(self, inputs, speaker):
+        input_text = self._sanitize_text(inputs)
+        input_tokens = self.tokenizer.encode(input_text)
+        task_tokens = self._prepare_tts_tokens(input_tokens, speaker)
+        task_tokens = torch.tensor(task_tokens).unsqueeze(0)
+
+        return {'input_ids': task_tokens, 'attention_mask': torch.ones_like(task_tokens)}
+
+    def _forward(self, model_inputs, **forward_args):
+
+        logits_processor=[
+            AlternatingCodebooksLogitsProcessor(
+                input_start_len=model_inputs['input_ids'].shape[-1],
+                codebook_size=2048,
+                num_codebooks=self.num_codebooks,
+                offset=self.audio_offset,
+                stop_token=self.stop_token
+            )
+        ]
+
+        outputs = self.model.generate(
+            model_inputs['input_ids'],
+            logits_processor=logits_processor
+        )
+
+        audio_tokens, attention_mask = [], []
+
+        for idx, inputs in enumerate(model_inputs['input_ids']):
+            truncated = outputs[idx, inputs.shape[-1]:]
+            end = torch.where(truncated == self.stop_token[0])[-1]
+    
+            if end.shape[-1] > 0:
+                end = end[0]
+            else:
+                end = truncated.shape[-1]
+    
+            truncated = truncated[:end]
+            truncated -= self.audio_offset
+            truncated = self._deserialize_tokens(torch.tensor(truncated), self.num_codebooks)
+            audio_tokens.append(truncated)
+            attention_mask.append(torch.ones_like(truncated))
+
+        audio_tokens = torch.vstack(audio_tokens).unsqueeze(0)
+        attention_mask = torch.vstack(attention_mask).unsqueeze(0)
+
+        audio = self.audio_tokenizer.decode(audio_tokens).audio_values
+
+        return {
+            'audio_tokens': audio_tokens, # (B, num_codebooks, num_samples)
+            'audio': audio # (B, 1, num_audio_samples)
+        }
+
+    def postprocess(self, model_outputs):
+        return model_outputs
+
+```
+
+--------------------------------------------------------------------------------
+
+## File 18/18: ui_components.py
+**Full path:** X:\gemma3n-hackathon\ui_components.py
+
+```python
+# ui_components.py
+
+import customtkinter as ctk
+import database_manager as db
+
+class WelcomeFrame(ctk.CTkFrame):
+    def __init__(self, master, login_callback):
+        super().__init__(master, corner_radius=0)
+        self.login_callback = login_callback
+
+        self.grid_columnconfigure(0, weight=1)
+        self.welcome_label = ctk.CTkLabel(self, text="Select Your Profile", font=("Roboto", 28, "bold"))
+        self.welcome_label.grid(row=0, column=0, pady=(100, 30), padx=20)
+        
+        self.buttons_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.buttons_frame.grid(row=1, column=0, sticky="ew")
+        self.buttons_frame.grid_columnconfigure(0, weight=1)
+        
+        self.populate_profile_buttons()
+
+    def populate_profile_buttons(self):
+        """Clears and rebuilds the login buttons."""
+        for widget in self.buttons_frame.winfo_children():
+            widget.destroy()
+
+        profiles = db.get_all_users()
+        for i, profile in enumerate(profiles):
+            button_text = f"{profile['username']} (ID: {profile['id']})"
+            button = ctk.CTkButton(
+                self.buttons_frame,
+                text=button_text,
+                font=("Roboto", 18),
+                command=lambda name=profile['username']: self.login_callback(name)
+            )
+            button.grid(row=i, column=0, pady=10, padx=150, sticky="ew")
+
+class AdminDashboard(ctk.CTkFrame):
+    def __init__(self, master, switch_profile_callback):
+        super().__init__(master)
+        self.switch_profile_callback = switch_profile_callback
+
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.sidebar = ctk.CTkFrame(self, width=180, corner_radius=0)
+        self.sidebar.grid(row=0, column=0, sticky="nsw")
+        ctk.CTkLabel(self.sidebar, text="Admin Menu", font=("Roboto", 20, "bold")).pack(pady=20)
+        ctk.CTkButton(self.sidebar, text="Switch Profile", command=self.switch_profile_callback).pack(pady=10, padx=20, fill="x")
+
+        content_area = ctk.CTkFrame(self, fg_color="transparent")
+        content_area.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        content_area.grid_columnconfigure((0, 1), weight=1)
+        content_area.grid_rowconfigure(0, weight=1)
+
+        add_user_frame = ctk.CTkFrame(content_area)
+        add_user_frame.grid(row=0, column=0, padx=(0, 10), pady=0, sticky="nsew")
+        add_user_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(add_user_frame, text="Add New User", font=("Roboto", 20, "bold")).grid(row=0, column=0, padx=10, pady=10)
+        ctk.CTkLabel(add_user_frame, text="Name:").grid(row=1, column=0, padx=10, pady=(10,0), sticky="w")
+        self.name_entry = ctk.CTkEntry(add_user_frame, placeholder_text="Enter name...")
+        self.name_entry.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(add_user_frame, text="Age:").grid(row=3, column=0, padx=10, pady=(10,0), sticky="w")
+        self.age_entry = ctk.CTkEntry(add_user_frame, placeholder_text="Enter age...")
+        self.age_entry.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+        ctk.CTkButton(add_user_frame, text="Add User", command=self.add_user_action).grid(row=5, column=0, padx=10, pady=20)
+
+        manage_users_frame = ctk.CTkFrame(content_area)
+        manage_users_frame.grid(row=0, column=1, padx=(10, 0), pady=0, sticky="nsew")
+        manage_users_frame.grid_columnconfigure(0, weight=1)
+        manage_users_frame.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(manage_users_frame, text="Manage Users", font=("Roboto", 20, "bold")).grid(row=0, column=0, padx=10, pady=10)
+        self.user_list_frame = ctk.CTkScrollableFrame(manage_users_frame, label_text="Existing Users")
+        self.user_list_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        self.user_list_frame.grid_columnconfigure(0, weight=1)
+        
+        self.status_label = ctk.CTkLabel(content_area, text="", font=("Roboto", 16))
+        self.status_label.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+        
+        self.refresh_user_list()
+
+    def add_user_action(self):
+        name = self.name_entry.get().strip()
+        age_str = self.age_entry.get().strip()
+        if not name or not age_str:
+            self.status_label.configure(text="Error: Name and age cannot be empty.", text_color="red")
+            return
+        if not age_str.isdigit() or int(age_str) <= 0:
+            self.status_label.configure(text="Error: Age must be a positive number.", text_color="red")
+            return
+        
+        success, message = db.add_user(name, int(age_str))
+        color = "green" if success else "red"
+        self.status_label.configure(text=message, text_color=color)
+        if success:
+            self.name_entry.delete(0, 'end')
+            self.age_entry.delete(0, 'end')
+            self.refresh_user_list()
+
+    def remove_user_action(self, user_id):
+        success, message = db.remove_user(user_id)
+        color = "green" if success else "red"
+        self.status_label.configure(text=message, text_color=color)
+        if success:
+            self.refresh_user_list()
+
+    def refresh_user_list(self):
+        for widget in self.user_list_frame.winfo_children():
+            widget.destroy()
+        all_users = db.get_all_users()
+        for user in all_users:
+            row_frame = ctk.CTkFrame(self.user_list_frame)
+            row_frame.pack(fill="x", pady=2)
+            row_frame.grid_columnconfigure(0, weight=1)
+            label_text = f"ID: {user['id']} | {user['username']} (Age: {user['age']})"
+            ctk.CTkLabel(row_frame, text=label_text).grid(row=0, column=0, padx=5, sticky="w")
+            if user['role'] != 'admin':
+                remove_button = ctk.CTkButton(
+                    row_frame, text="Remove", width=80, fg_color="red", hover_color="#c00",
+                    command=lambda u_id=user['id']: self.remove_user_action(u_id)
+                )
+                remove_button.grid(row=0, column=1, padx=5)
+
+class MainAppFrame(ctk.CTkFrame):
+    def __init__(self, master):
+        super().__init__(master)
+        
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+
+        sidebar_frame = ctk.CTkFrame(self, width=150, corner_radius=0)
+        sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsw")
+        ctk.CTkLabel(sidebar_frame, text="Controls", font=("Roboto", 24, "bold")).pack(padx=20, pady=(20, 10))
+        self.audio_status_label = ctk.CTkLabel(sidebar_frame, text="Status: Ready", wraplength=130, font=("Roboto", 16))
+        self.audio_status_label.pack(padx=20, pady=20)
+
+        # --- NEW: Transcript Label ---
+        self.transcript_label = ctk.CTkLabel(
+            sidebar_frame, 
+            text="You said: ...", 
+            wraplength=130, 
+            font=("Roboto", 14, "italic"),
+            anchor="w"
+        )
+        self.transcript_label.pack(padx=20, pady=(40, 0), fill="x")
+
+
+        main_container = ctk.CTkFrame(self, corner_radius=10)
+        main_container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        main_container.grid_rowconfigure(0, weight=1)
+        main_container.grid_columnconfigure(0, weight=1)
+
+        self.interview_screen_frame = ctk.CTkFrame(main_container, fg_color="#2a3b47")
+        ctk.CTkLabel(self.interview_screen_frame, text="Interview Screen", font=("Roboto", 32, "bold")).pack(pady=50)
+        
+        self.feedback_screen_frame = ctk.CTkFrame(main_container, fg_color="#2a3b47")
+        ctk.CTkLabel(self.feedback_screen_frame, text="Feedback Screen", font=("Roboto", 32, "bold")).pack(pady=50)
+
+    def show_screen(self, screen_name):
+        """Hides all screens and shows the selected one."""
+        self.interview_screen_frame.grid_forget()
+        self.feedback_screen_frame.grid_forget()
+        
+        if screen_name == "interview_screen":
+            self.interview_screen_frame.grid(row=0, column=0, sticky="nsew")
+        elif screen_name == "feedback_screen":
+            self.feedback_screen_frame.grid(row=0, column=0, sticky="nsew")
+```
+
+--------------------------------------------------------------------------------
+

@@ -1,5 +1,4 @@
-import ollama
-import config
+# import config
 import prompts
 from data_models import InterviewDataRow
 from datetime import datetime
@@ -11,14 +10,16 @@ def calculate_vocal_metrics(text, duration):
     # Filler count logic is now removed.
     return {"wpm": round(wpm)}
 
-def analyze_content_with_gemma(question, answer, model_name):
+def analyze_content_with_gemma(gemma_model, process_func, question, answer):
+    """MODIFIED to accept the gemma_model instance and processing function."""
     print(f"Analyzing answer for question: '{question}'")
     prompt = prompts.CONTENT_ANALYSIS_PROMPT.format(question=question, answer=answer)
-    messages = [{'role': 'user', 'content': prompt}]
+    full_prompt = f"[INST]\n{prompt}\n[/INST]"
+    
     try:
-        response = ollama.chat(model=model_name, messages=messages)
+        response_text = process_func(full_prompt, max_tokens=300)
         analysis = {}
-        for line in response['message']['content'].split('\n'):
+        for line in response_text.split('\n'):
             if ':' in line:
                 key, value = line.split(':', 1)
                 clean_key = key.strip().lower().replace(" ", "_").strip('\'"')
@@ -28,29 +29,32 @@ def analyze_content_with_gemma(question, answer, model_name):
         print(f"Error during content analysis: {e}")
         return {}
 
-def run_full_analysis(conversation_history, model_name, interview_type):
+def run_full_analysis(gemma_model, process_func, conversation_history, interview_type):
+    """MODIFIED to pass the model and process_func down."""
     print("\n--- Starting Post-Interview Analysis ---")
     validated_rows = []
+    # Note: 'duration' is not yet in the GUI conversation history, we'll add a placeholder.
     questions = [msg['content'] for msg in conversation_history if msg['role'] == 'assistant']
-    answers = [{'text': msg['content'], 'duration': msg['duration']} for msg in conversation_history if msg['role'] == 'user']
+    answers = [msg['content'] for msg in conversation_history if msg['role'] == 'user']
     
     interview_id = uuid.uuid4()
     timestamp = datetime.now()
 
-    for i, answer_data in enumerate(answers):
+    for i, answer_text in enumerate(answers):
         if i >= len(questions): break
         
         question = questions[i]
-        answer_text = answer_data['text']
-        answer_duration = answer_data['duration']
         
+        # Placeholder for duration, as our GUI listener doesn't provide it yet.
+        answer_duration = (len(answer_text.split()) / 150) * 60 # Estimate duration based on avg WPM
+
         vocal_metrics = calculate_vocal_metrics(answer_text, answer_duration)
-        content_analysis = analyze_content_with_gemma(question, answer_text, model_name)
+        content_analysis = analyze_content_with_gemma(gemma_model, process_func, question, answer_text)
         
         full_data = {
             "interview_id": interview_id, "timestamp": timestamp, "interview_type": interview_type,
             "question_number": i + 1, "question_text": question, "answer_text": answer_text,
-            **vocal_metrics, **content_analysis
+            "wpm": vocal_metrics['wpm'], **content_analysis
         }
         
         try:

@@ -121,8 +121,10 @@ class AdminDashboard(ctk.CTkFrame):
                 remove_button.grid(row=0, column=1, padx=5)
 
 class MainAppFrame(ctk.CTkFrame):
-    def __init__(self, master):
-        super().__init__(master)
+    def __init__(self, master, **kwargs):
+        super().__init__(master, **kwargs)
+
+        self.app = master
         
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
@@ -149,9 +151,23 @@ class MainAppFrame(ctk.CTkFrame):
         main_container.grid_rowconfigure(0, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
 
-        self.interview_screen_frame = ctk.CTkFrame(main_container, fg_color="#2a3b47")
-        ctk.CTkLabel(self.interview_screen_frame, text="Interview Screen", font=("Roboto", 32, "bold")).pack(pady=50)
-        
+        # --- MODIFIED: Interview Screen is now a grid with a chat history ---
+        self.interview_screen_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        self.interview_screen_frame.grid_rowconfigure(1, weight=1) # Allow chat history to expand
+        self.interview_screen_frame.grid_columnconfigure((0, 1), weight=1)
+
+        # Control buttons at the top
+        self.background_button = ctk.CTkButton(self.interview_screen_frame, text="Start Background Interview", command=lambda: self.app.start_interview_session("Background"))
+        self.background_button.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="ew")
+        self.salary_button = ctk.CTkButton(self.interview_screen_frame, text="Start Salary Negotiation", command=lambda: self.app.start_interview_session("Salary Negotiation"))
+        self.salary_button.grid(row=0, column=1, padx=(5, 10), pady=10, sticky="ew")
+
+        # --- NEW: Scrollable frame for the chat history ---
+        self.chat_history_frame = ctk.CTkScrollableFrame(self.interview_screen_frame, label_text="Interview Transcript")
+        self.chat_history_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="nsew")
+        self.chat_history_frame.grid_columnconfigure(0, weight=1)
+
+        # --- Feedback screen setup (Unchanged) ---
         self.feedback_screen_frame = ctk.CTkFrame(main_container, fg_color="#2a3b47")
         ctk.CTkLabel(self.feedback_screen_frame, text="Feedback Screen", font=("Roboto", 32, "bold")).pack(pady=50)
 
