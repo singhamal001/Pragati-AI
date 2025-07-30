@@ -30,6 +30,26 @@ def initialize_database():
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                interview_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                interview_type TEXT NOT NULL,
+                question_number INTEGER NOT NULL,
+                question_text TEXT NOT NULL,
+                answer_text TEXT NOT NULL,
+                wpm INTEGER,
+                star_score INTEGER,
+                star_reason TEXT,
+                keywords_score INTEGER,
+                keywords_reason TEXT,
+                professionalism_score INTEGER,
+                professionalism_reason TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        """)
         cursor.execute("SELECT COUNT(*) FROM users")
         if cursor.fetchone()[0] == 0:
             print("No users found. Creating default Admin profile...")

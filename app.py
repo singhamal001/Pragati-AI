@@ -18,7 +18,7 @@ from pydub.playback import play
 import prompts
 import gemma_logic
 import interview_analyzer
-import data_storage
+import feedback_manager
 
 import interview_flow_manager
 
@@ -62,8 +62,33 @@ AI_PERSONAS = {
     "SUMMARIZER": """
     You are a data analysis AI. The following is a conversation with a new user. Your sole task is to read the entire conversation and generate a JSON object summarizing the user's profile. The JSON should have three keys: "interests" (a list of strings), "goals" (a list of strings), and "challenges" (a list of strings). Output ONLY the raw JSON object and nothing else.
     """,
+     "FEEDBACK_COACH": """
+    You are Gemma, an encouraging and insightful AI career coach. Your task is to help a visually impaired user understand their interview feedback report and answer their questions about it.
+
+    **CONTEXT:** The user has selected a past interview report. The full text of that report will be provided to you.
+
+    **YOUR PROCESS:**
+    1.  **INITIAL SUMMARY:** Your VERY FIRST response MUST be a high-level, conversational summary of the provided report. Start by highlighting 1-2 key strengths (what went well) and then 1-2 main areas for improvement (what to focus on next). Keep this initial summary concise.
+    2.  **Q&A SESSION:** After your initial summary, the user will ask you questions. Answer them based ONLY on the information in the provided report text. Be supportive and provide actionable advice.
+    3.  **CONCLUDE:** When the user indicates they are finished (e.g., "that's all," "thank you," "end session"), your final response, and ONLY your final response, MUST be the special command: `[END_FEEDBACK]`.
+
+    Do not make up information not present in the report.
+    """,
     "NARRATIVE_SUMMARIZER": """
     You are an expert summarization AI. Read the following conversation with a new user and generate a concise, one-paragraph summary (under 150 words) that captures the user's background, primary goals, and key challenges mentioned. This summary will be used as a quick human-readable reference. Respond with ONLY the paragraph summary and nothing else.
+    """,
+    "EXIT_DETECTOR": """
+    You are a simple binary classification AI. Your only task is to determine if the user's statement expresses an intent to end the current conversation.
+
+    RULES:
+    - If the user's statement means they want to stop, leave, or are finished, respond with ONLY the keyword: `YES_EXIT`.
+    - If the user is asking a question or making any other statement, respond with ONLY the keyword: `NO_EXIT`.
+
+    EXAMPLES:
+    - User says: "thank you, I'm done" -> Your Response: `YES_EXIT`
+    - User says: "that's all for now" -> Your Response: `YES_EXIT`
+    - User says: "what was my star score for question 3?" -> Your Response: `NO_EXIT`
+    - User says: "can you explain that differently" -> Your Response: `NO_EXIT`
     """
 }
 
@@ -296,6 +321,170 @@ class App(ctk.CTk):
         """
         output = self.gemma_model(full_prompt, max_tokens=max_tokens, stop=["</s>", "[INST]", "User:", "Assistant:"], echo=False)
         return output['choices'][0]['text'].strip()
+    
+    def populate_interview_list(self):
+        # Clear any existing buttons
+        for widget in self.current_frame.interview_list_frame.winfo_children():
+            widget.destroy()
+
+        # Get all past interviews for the current user
+        interviews = feedback_manager.get_all_interviews_for_user(self.current_user['id'])
+
+        if not interviews:
+            ctk.CTkLabel(self.current_frame.interview_list_frame, text="No reports found.").pack(pady=10)
+            return
+
+        for interview in interviews:
+            # Format the date nicely
+            date_str = interview['timestamp'].split(" ")[0]
+            button_text = f"{interview['interview_type']}\n{date_str}"
+            
+            button = ctk.CTkButton(
+                self.current_frame.interview_list_frame,
+                text=button_text,
+                command=lambda i_id=interview['interview_id']: self.display_feedback_report(i_id)
+            )
+            button.pack(fill="x", padx=5, pady=5)
+
+    # --- NEW: Function to display the details of a selected report ---
+    def display_feedback_report(self, interview_id: str):
+        report_details = feedback_manager.get_report_details_by_interview_id(interview_id)
+
+        if not report_details:
+            formatted_text = "Error: Could not retrieve report details."
+        else:
+            # Format the details into a nice string
+            header = f"Report for {report_details[0]['interview_type']} Interview\n"
+            header += f"Date: {report_details[0]['timestamp']}\n"
+            header += "="*50 + "\n\n"
+            
+            q_and_a = []
+            for item in report_details:
+                q_text = f"Q{item['question_number']}: {item['question_text']}\n"
+                a_text = f"Your Answer: {item['answer_text']}\n\n"
+                
+                s_score = f"  - STAR Score: {item.get('star_score', 'N/A')}/10\n"
+                s_reason = f"    Reason: {item.get('star_reason', 'N/A')}\n"
+                k_score = f"  - Keywords Score: {item.get('keywords_score', 'N/A')}/10\n"
+                k_reason = f"    Reason: {item.get('keywords_reason', 'N/A')}\n"
+                p_score = f"  - Professionalism: {item.get('professionalism_score', 'N/A')}/10\n"
+                p_reason = f"    Reason: {item.get('professionalism_reason', 'N/A')}\n"
+                
+                q_and_a.append(q_text + a_text + s_score + s_reason + k_score + k_reason + p_score + p_reason)
+
+            formatted_text = header + "\n---\n\n".join(q_and_a)
+        
+        # Update the textbox
+        textbox = self.current_frame.report_display_textbox
+        textbox.configure(state="normal") # Enable writing
+        textbox.delete("1.0", "end")
+        textbox.insert("1.0", formatted_text)
+        textbox.configure(state="disabled") # Disable writing
+        self.current_frame.discuss_button.configure(state="normal")
+    
+    def start_feedback_session(self):
+        if self.interview_in_progress: # Use the same flag to prevent conflicts
+            print("Cannot start feedback session while an interview is active.")
+            return
+
+        # 1. Get the report text from the UI
+        report_text = self.current_frame.report_display_textbox.get("1.0", "end")
+        if not report_text or len(report_text.strip()) < 20:
+            print("Error: No report loaded to discuss.")
+            self.speak("Please select a report from the list first.")
+            return
+
+        # 2. Set the application state
+        self.app_state = "FEEDBACK_QA"
+        print(f"DEBUG: App state changed to {self.app_state}")
+
+        # 3. Stop the background listener
+        if self.listener_stop_flag:
+            self.listener_stop_flag.set()
+
+        self.interview_in_progress = True # Reuse flag to lock UI
+
+        # 4. Start the feedback thread
+        threading.Thread(target=self._feedback_thread, args=(report_text,), daemon=True).start()
+
+    def _feedback_thread(self, report_text: str):
+        """
+        MODIFIED: This version has a simplified and corrected prompt structure
+        to prevent AI confusion and restore correct conversational behavior.
+        """
+        # --- Setup Phase (Unchanged) ---
+        self.after(0, lambda: self.current_frame.discuss_button.configure(state="disabled"))
+        self.after(0, lambda: self.current_frame.return_button.configure(state="disabled"))
+        self.update_status("Starting Feedback...")
+
+        feedback_history = []
+        
+        # --- First Turn: Initial Summary (Unchanged, this part works well) ---
+        initial_prompt = f"""
+        [INST]
+        {AI_PERSONAS['FEEDBACK_COACH']}
+        Here is the full interview report to discuss:
+        ---
+        {report_text}
+        ---
+        Now, provide your initial summary of what went well and what can be improved.
+        [/INST]
+        """
+        # We will use one consistent variable for the AI's response
+        ai_response = self._process_gemma_response(initial_prompt, max_tokens=300)
+        feedback_history.append({"role": "assistant", "content": ai_response})
+        
+        # --- Main Q&A Loop (CORRECTED) ---
+        while True:
+            # The last AI response is spoken to prompt the user
+            user_question = self.listen_after_prompt(prompt_text=ai_response)
+            
+            if not user_question:
+                self.speak("I'm sorry, I didn't catch that. Could you ask your question again?")
+                continue
+
+            # First, check for exit intent using our specialist
+            exit_check_prompt = f"""[INST]{AI_PERSONAS['EXIT_DETECTOR']}
+            User says: "{user_question}"[/INST]"""
+            exit_decision = self._process_gemma_response(exit_check_prompt, max_tokens=10)
+
+            if "YES_EXIT" in exit_decision:
+                print("DEBUG: Exit intent detected.")
+                self.speak("Of course. I'm glad I could help. Ending the feedback session now.")
+                break
+
+            # If not exiting, add the user's question to the history
+            feedback_history.append({"role": "user", "content": user_question})
+            history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in feedback_history])
+            
+            # --- THIS IS THE SIMPLIFIED AND CORRECTED PROMPT ---
+            # It clearly restates the persona and the goal in every turn.
+            qa_prompt = f"""
+            [INST]
+            You are Gemma, the helpful Feedback Coach.
+            The user is asking questions about the following report:
+            ---
+            {report_text}
+            ---
+            Here is the conversation so far:
+            {history_str}
+            ---
+            Based on the user's last question, provide a helpful and encouraging answer.
+            [/INST]
+            """
+            
+            # We re-assign the new AI response to our main variable
+            ai_response = self._process_gemma_response(qa_prompt, max_tokens=300)
+            feedback_history.append({"role": "assistant", "content": ai_response})
+
+        # --- Teardown Phase (Unchanged) ---
+        self.after(0, lambda: self.current_frame.discuss_button.configure(state="normal"))
+        self.after(0, lambda: self.current_frame.return_button.configure(state="normal"))
+        self.app_state = "NAVIGATION"
+        self.update_status("Ready for commands.")
+        self.interview_in_progress = False
+        self.listener_stop_flag = threading.Event()
+        threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
 
     def onboarding_listener(self):
         """Manages the conversational onboarding flow with correct prompt formatting."""
@@ -472,7 +661,6 @@ class App(ctk.CTk):
                 self.speak("We've covered a lot today, so let's wrap up there. Thank you.")
                 break
 
-        # --- Analysis Phase (This part remains the same) ---
         self.update_status("Interview finished. Analyzing...")
         self.speak("The interview is now complete. I'm analyzing your responses now...")
         
@@ -480,7 +668,7 @@ class App(ctk.CTk):
             self.gemma_model, self._process_gemma_response, interview_history, interview_type
         )
         if analysis_results:
-            data_storage.save_report_to_csv(analysis_results)
+            feedback_manager.save_feedback_to_db(self.current_user['id'], analysis_results)
             self.speak("Great session! Your detailed feedback report has been saved.")
         else:
             self.speak("There was an issue generating the analysis, so no report was saved.")
@@ -498,6 +686,13 @@ class App(ctk.CTk):
         print(f"DEBUG: App state changed back to {self.app_state}. Restarting background listener.")
         
         self.interview_in_progress = False
+
+        # --- Automatically switch to the feedback screen ---
+        if analysis_results:
+            new_interview_id = analysis_results[0].interview_id
+            self.after(0, self.current_frame.show_screen, "feedback_screen")
+            self.after(200, self.display_feedback_report, new_interview_id)
+        # --------------------------------------------------------
 
         # This is now the ONLY call to restart the listener. It is correct.
         self.listener_stop_flag = threading.Event()

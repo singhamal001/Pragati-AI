@@ -123,53 +123,82 @@ class AdminDashboard(ctk.CTkFrame):
 class MainAppFrame(ctk.CTkFrame):
     def __init__(self, master, **kwargs):
         super().__init__(master, **kwargs)
-
         self.app = master
-        
+
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
+        # --- Sidebar (Unchanged) ---
         sidebar_frame = ctk.CTkFrame(self, width=150, corner_radius=0)
         sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsw")
         ctk.CTkLabel(sidebar_frame, text="Controls", font=("Roboto", 24, "bold")).pack(padx=20, pady=(20, 10))
+        self.feedback_button = ctk.CTkButton(sidebar_frame, text="View Feedback", command=lambda: self.show_screen("feedback_screen"))
+        self.feedback_button.pack(padx=20, pady=10, fill="x")
         self.audio_status_label = ctk.CTkLabel(sidebar_frame, text="Status: Ready", wraplength=130, font=("Roboto", 16))
         self.audio_status_label.pack(padx=20, pady=20)
-
-        # --- NEW: Transcript Label ---
-        self.transcript_label = ctk.CTkLabel(
-            sidebar_frame, 
-            text="You said: ...", 
-            wraplength=130, 
-            font=("Roboto", 14, "italic"),
-            anchor="w"
-        )
+        self.transcript_label = ctk.CTkLabel(sidebar_frame, text="You said: ...", wraplength=130, font=("Roboto", 14, "italic"), anchor="w")
         self.transcript_label.pack(padx=20, pady=(40, 0), fill="x")
 
-
+        # --- Main Container (Unchanged) ---
         main_container = ctk.CTkFrame(self, corner_radius=10)
         main_container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
         main_container.grid_rowconfigure(0, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
 
-        # --- MODIFIED: Interview Screen is now a grid with a chat history ---
+        # --- Interview Screen (Unchanged) ---
         self.interview_screen_frame = ctk.CTkFrame(main_container, fg_color="transparent")
-        self.interview_screen_frame.grid_rowconfigure(1, weight=1) # Allow chat history to expand
+        self.interview_screen_frame.grid_rowconfigure(1, weight=1)
         self.interview_screen_frame.grid_columnconfigure((0, 1), weight=1)
-
-        # Control buttons at the top
         self.background_button = ctk.CTkButton(self.interview_screen_frame, text="Start Background Interview", command=lambda: self.app.start_interview_session("Background"))
         self.background_button.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="ew")
         self.salary_button = ctk.CTkButton(self.interview_screen_frame, text="Start Salary Negotiation", command=lambda: self.app.start_interview_session("Salary Negotiation"))
         self.salary_button.grid(row=0, column=1, padx=(5, 10), pady=10, sticky="ew")
-
-        # --- NEW: Scrollable frame for the chat history ---
         self.chat_history_frame = ctk.CTkScrollableFrame(self.interview_screen_frame, label_text="Interview Transcript")
         self.chat_history_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="nsew")
         self.chat_history_frame.grid_columnconfigure(0, weight=1)
 
-        # --- Feedback screen setup (Unchanged) ---
-        self.feedback_screen_frame = ctk.CTkFrame(main_container, fg_color="#2a3b47")
-        ctk.CTkLabel(self.feedback_screen_frame, text="Feedback Screen", font=("Roboto", 32, "bold")).pack(pady=50)
+        # =============================================================== #
+        # ---            THIS IS THE CORRECTED UI SECTION             --- #
+        # =============================================================== #
+        self.feedback_screen_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        self.feedback_screen_frame.grid_rowconfigure(1, weight=1)
+        self.feedback_screen_frame.grid_columnconfigure(1, weight=1)
+
+        # --- NEW: A top frame to hold the buttons and title ---
+        feedback_top_frame = ctk.CTkFrame(self.feedback_screen_frame, fg_color="transparent")
+        feedback_top_frame.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+        feedback_top_frame.grid_columnconfigure(2, weight=1) # Allow title to expand
+
+        # --- NEW: The "Back to Interview" button ---
+        self.return_button = ctk.CTkButton(feedback_top_frame, text="< Back to Interview", command=lambda: self.show_screen("interview_screen"))
+        self.return_button.grid(row=0, column=0, padx=(0, 10), sticky="w")
+        
+        # --- THIS IS THE MISSING BUTTON ---
+        self.discuss_button = ctk.CTkButton(
+            feedback_top_frame, text="Start Audio Feedback Session",
+            command=self.app.start_feedback_session,
+            state="disabled" # Starts disabled
+        )
+        self.discuss_button.grid(row=0, column=1, padx=10, sticky="w")
+        # ------------------------------------
+
+        ctk.CTkLabel(feedback_top_frame, text="Feedback Reports", font=("Roboto", 24, "bold")).grid(row=0, column=2, sticky="w")
+
+        # --- The rest of the feedback screen widgets ---
+        self.interview_list_frame = ctk.CTkScrollableFrame(self.feedback_screen_frame, label_text="Past Sessions", width=250)
+        self.interview_list_frame.grid(row=1, column=0, padx=(10, 5), pady=(0, 10), sticky="ns")
+        self.report_display_textbox = ctk.CTkTextbox(self.feedback_screen_frame, wrap="word", font=("Roboto", 14), state="disabled")
+        self.report_display_textbox.grid(row=1, column=1, padx=(5, 10), pady=(0, 10), sticky="nsew")
+
+    def show_screen(self, screen_name):
+        self.interview_screen_frame.grid_forget()
+        self.feedback_screen_frame.grid_forget()
+        
+        if screen_name == "interview_screen":
+            self.interview_screen_frame.grid(row=0, column=0, sticky="nsew")
+        elif screen_name == "feedback_screen":
+            self.feedback_screen_frame.grid(row=0, column=0, sticky="nsew")
+            self.app.populate_interview_list()
 
     def show_screen(self, screen_name):
         """Hides all screens and shows the selected one."""
@@ -180,3 +209,4 @@ class MainAppFrame(ctk.CTkFrame):
             self.interview_screen_frame.grid(row=0, column=0, sticky="nsew")
         elif screen_name == "feedback_screen":
             self.feedback_screen_frame.grid(row=0, column=0, sticky="nsew")
+            self.app.populate_interview_list()
