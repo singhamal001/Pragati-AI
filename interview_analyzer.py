@@ -7,7 +7,6 @@ import uuid
 def calculate_vocal_metrics(text, duration):
     word_count = len(text.split())
     wpm = (word_count / duration) * 60 if duration > 0 else 0
-    # Filler count logic is now removed.
     return {"wpm": round(wpm)}
 
 def analyze_content_with_gemma(gemma_model, process_func, question, answer):
@@ -33,7 +32,6 @@ def run_full_analysis(gemma_model, process_func, conversation_history, interview
     """MODIFIED to pass the model and process_func down."""
     print("\n--- Starting Post-Interview Analysis ---")
     validated_rows = []
-    # Note: 'duration' is not yet in the GUI conversation history, we'll add a placeholder.
     questions = [msg['content'] for msg in conversation_history if msg['role'] == 'assistant']
     answers = [msg['content'] for msg in conversation_history if msg['role'] == 'user']
     
@@ -45,8 +43,7 @@ def run_full_analysis(gemma_model, process_func, conversation_history, interview
         
         question = questions[i]
         
-        # Placeholder for duration, as our GUI listener doesn't provide it yet.
-        answer_duration = (len(answer_text.split()) / 150) * 60 # Estimate duration based on avg WPM
+        answer_duration = (len(answer_text.split()) / 150) * 60
 
         vocal_metrics = calculate_vocal_metrics(answer_text, answer_duration)
         content_analysis = analyze_content_with_gemma(gemma_model, process_func, question, answer_text)

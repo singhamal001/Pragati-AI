@@ -193,3 +193,24 @@ def update_user_preferences(user_id, new_preferences):
     finally:
         if conn:
             conn.close()
+
+def remove_last_message(user_id):
+    """Removes the most recent message for a user."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        # Find the ID of the most recent message for the user
+        cursor.execute(
+            "SELECT id FROM conversation_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1",
+            (user_id,)
+        )
+        last_message = cursor.fetchone()
+        if last_message:
+            # Delete that specific message
+            cursor.execute("DELETE FROM conversation_history WHERE id = ?", (last_message,))
+            conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error removing last message: {e}")
+    finally:
+        if conn:
+            conn.close()

@@ -46,18 +46,6 @@ def generate_audio(text_to_speak: str, output_filename: str):
     print("-" * 50)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Generate a WAV audio file from text using Piper TTS."
-    )
-    parser.add_argument(
-        "text",
-        type=str,
-        help="The text to be converted to speech, enclosed in quotes."
-    )
-    parser.add_argument(
-        "filename",
-        type=str,
-        help="The desired name for the output WAV file (e.g., 'my_audio.wav')."
-    )
-    args = parser.parse_args()
-    generate_audio(args.text, args.filename)
+    text = "Which report would you like to discuss? You can say, for example, 'the first one', or 'the most recent one' or 'the second one'."
+    filename = "feedback_prompt_for_selection"
+    generate_audio(text, filename)

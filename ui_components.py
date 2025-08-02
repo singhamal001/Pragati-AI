@@ -136,6 +136,11 @@ class MainAppFrame(ctk.CTkFrame):
         self.feedback_button.pack(padx=20, pady=10, fill="x")
         self.audio_status_label = ctk.CTkLabel(sidebar_frame, text="Status: Ready", wraplength=130, font=("Roboto", 16))
         self.audio_status_label.pack(padx=20, pady=20)
+        self.speaking_indicator = ctk.CTkProgressBar(
+            sidebar_frame,
+            mode="indeterminate",
+            height=4  # A nice, thin bar
+        )
         self.transcript_label = ctk.CTkLabel(sidebar_frame, text="You said: ...", wraplength=130, font=("Roboto", 14, "italic"), anchor="w")
         self.transcript_label.pack(padx=20, pady=(40, 0), fill="x")
 
@@ -189,24 +194,34 @@ class MainAppFrame(ctk.CTkFrame):
         self.interview_list_frame.grid(row=1, column=0, padx=(10, 5), pady=(0, 10), sticky="ns")
         self.report_display_textbox = ctk.CTkTextbox(self.feedback_screen_frame, wrap="word", font=("Roboto", 14), state="disabled")
         self.report_display_textbox.grid(row=1, column=1, padx=(5, 10), pady=(0, 10), sticky="nsew")
-
+    
     def show_screen(self, screen_name):
+        """
+        Hides all screens, shows the selected one, and correctly manages the
+        application's listener state for different modes.
+        """
+        # First, hide all main content frames
         self.interview_screen_frame.grid_forget()
         self.feedback_screen_frame.grid_forget()
-        
-        if screen_name == "interview_screen":
-            self.interview_screen_frame.grid(row=0, column=0, sticky="nsew")
-        elif screen_name == "feedback_screen":
-            self.feedback_screen_frame.grid(row=0, column=0, sticky="nsew")
-            self.app.populate_interview_list()
 
-    def show_screen(self, screen_name):
-        """Hides all screens and shows the selected one."""
-        self.interview_screen_frame.grid_forget()
-        self.feedback_screen_frame.grid_forget()
-        
+        # Now, decide which screen to show and what actions to take
         if screen_name == "interview_screen":
+            # If we are in feedback mode, we must exit it before showing the interview screen.
+            self.app.exit_feedback_mode_if_active()
+            
+            # Show the interview screen and play its specific prompt
             self.interview_screen_frame.grid(row=0, column=0, sticky="nsew")
+            self.app.play_audio("interview_screen_prompt")
+
         elif screen_name == "feedback_screen":
+            # When entering the feedback screen, we must start the dedicated feedback listener.
+            
+            # Show the feedback screen frame
             self.feedback_screen_frame.grid(row=0, column=0, sticky="nsew")
+            
+            # Silently populate the visual list of past sessions in the UI
             self.app.populate_interview_list()
+            
+            # This is the crucial call that starts the entire voice-driven feedback flow.
+            # The listener itself will handle all audio prompts from this point on.
+            self.app.enter_feedback_mode()

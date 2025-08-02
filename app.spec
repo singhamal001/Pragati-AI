@@ -5,7 +5,10 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('./model', 'model'),
+        ('./assets', 'assets')
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -22,7 +25,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='app',
+    name='Pragati-AI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
