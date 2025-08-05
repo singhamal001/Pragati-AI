@@ -415,7 +415,8 @@ class App(ctk.CTk):
     def _load_models(self):
         if not self.whisper_model:
             self.update_status("Loading speech model...")
-            self.whisper_model = whisper.load_model("base.en")
+            whisper_model_path = resource_path("./model/base.en.pt")
+            self.whisper_model = whisper.load_model(whisper_model_path)
         if not self.gemma_model:
             self.update_status("Loading Gemma AI...")
             self.gemma_model = Llama(model_path=MODEL_PATH, n_ctx=2048, verbose=False)
