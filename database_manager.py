@@ -199,7 +199,6 @@ def remove_last_message(user_id):
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        # Find the ID of the most recent message for the user
         cursor.execute(
             "SELECT id FROM conversation_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1",
             (user_id,)

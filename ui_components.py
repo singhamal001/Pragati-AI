@@ -128,7 +128,6 @@ class MainAppFrame(ctk.CTkFrame):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
-        # --- Sidebar (Unchanged) ---
         sidebar_frame = ctk.CTkFrame(self, width=150, corner_radius=0)
         sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsw")
         ctk.CTkLabel(sidebar_frame, text="Controls", font=("Roboto", 24, "bold")).pack(padx=20, pady=(20, 10))
@@ -139,18 +138,16 @@ class MainAppFrame(ctk.CTkFrame):
         self.speaking_indicator = ctk.CTkProgressBar(
             sidebar_frame,
             mode="indeterminate",
-            height=4  # A nice, thin bar
+            height=4
         )
         self.transcript_label = ctk.CTkLabel(sidebar_frame, text="You said: ...", wraplength=130, font=("Roboto", 14, "italic"), anchor="w")
         self.transcript_label.pack(padx=20, pady=(40, 0), fill="x")
 
-        # --- Main Container (Unchanged) ---
         main_container = ctk.CTkFrame(self, corner_radius=10)
         main_container.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
         main_container.grid_rowconfigure(0, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
 
-        # --- Interview Screen (Unchanged) ---
         self.interview_screen_frame = ctk.CTkFrame(main_container, fg_color="transparent")
         self.interview_screen_frame.grid_rowconfigure(1, weight=1)
         self.interview_screen_frame.grid_columnconfigure((0, 1), weight=1)
@@ -162,34 +159,26 @@ class MainAppFrame(ctk.CTkFrame):
         self.chat_history_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky="nsew")
         self.chat_history_frame.grid_columnconfigure(0, weight=1)
 
-        # =============================================================== #
-        # ---            THIS IS THE CORRECTED UI SECTION             --- #
-        # =============================================================== #
         self.feedback_screen_frame = ctk.CTkFrame(main_container, fg_color="transparent")
         self.feedback_screen_frame.grid_rowconfigure(1, weight=1)
         self.feedback_screen_frame.grid_columnconfigure(1, weight=1)
 
-        # --- NEW: A top frame to hold the buttons and title ---
         feedback_top_frame = ctk.CTkFrame(self.feedback_screen_frame, fg_color="transparent")
         feedback_top_frame.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
-        feedback_top_frame.grid_columnconfigure(2, weight=1) # Allow title to expand
+        feedback_top_frame.grid_columnconfigure(2, weight=1)
 
-        # --- NEW: The "Back to Interview" button ---
         self.return_button = ctk.CTkButton(feedback_top_frame, text="< Back to Interview", command=lambda: self.show_screen("interview_screen"))
         self.return_button.grid(row=0, column=0, padx=(0, 10), sticky="w")
         
-        # --- THIS IS THE MISSING BUTTON ---
         self.discuss_button = ctk.CTkButton(
             feedback_top_frame, text="Start Audio Feedback Session",
             command=self.app.start_feedback_session,
-            state="disabled" # Starts disabled
+            state="disabled"
         )
         self.discuss_button.grid(row=0, column=1, padx=10, sticky="w")
-        # ------------------------------------
 
         ctk.CTkLabel(feedback_top_frame, text="Feedback Reports", font=("Roboto", 24, "bold")).grid(row=0, column=2, sticky="w")
 
-        # --- The rest of the feedback screen widgets ---
         self.interview_list_frame = ctk.CTkScrollableFrame(self.feedback_screen_frame, label_text="Past Sessions", width=250)
         self.interview_list_frame.grid(row=1, column=0, padx=(10, 5), pady=(0, 10), sticky="ns")
         self.report_display_textbox = ctk.CTkTextbox(self.feedback_screen_frame, wrap="word", font=("Roboto", 14), state="disabled")
@@ -200,28 +189,19 @@ class MainAppFrame(ctk.CTkFrame):
         Hides all screens, shows the selected one, and correctly manages the
         application's listener state for different modes.
         """
-        # First, hide all main content frames
         self.interview_screen_frame.grid_forget()
         self.feedback_screen_frame.grid_forget()
 
-        # Now, decide which screen to show and what actions to take
         if screen_name == "interview_screen":
-            # If we are in feedback mode, we must exit it before showing the interview screen.
             self.app.exit_feedback_mode_if_active()
             
-            # Show the interview screen and play its specific prompt
             self.interview_screen_frame.grid(row=0, column=0, sticky="nsew")
             self.app.play_audio("interview_screen_prompt")
 
         elif screen_name == "feedback_screen":
-            # When entering the feedback screen, we must start the dedicated feedback listener.
             
-            # Show the feedback screen frame
             self.feedback_screen_frame.grid(row=0, column=0, sticky="nsew")
             
-            # Silently populate the visual list of past sessions in the UI
             self.app.populate_interview_list()
             
-            # This is the crucial call that starts the entire voice-driven feedback flow.
-            # The listener itself will handle all audio prompts from this point on.
             self.app.enter_feedback_mode()

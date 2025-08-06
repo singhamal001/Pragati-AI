@@ -1,9 +1,9 @@
 # feedback_manager.py
 
 import sqlite3
-from data_models import InterviewDataRow # We still use this for data validation
+from data_models import InterviewDataRow
 
-DB_FILE = "profiles.db" # It uses the same database file
+DB_FILE = "profiles.db"
 
 def save_feedback_to_db(user_id: int, pydantic_rows: list[InterviewDataRow]):
     """
@@ -18,16 +18,12 @@ def save_feedback_to_db(user_id: int, pydantic_rows: list[InterviewDataRow]):
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
 
-        # Prepare the data for insertion
         rows_to_insert = []
         for row_model in pydantic_rows:
-            # Convert the Pydantic model to a dictionary
             data = row_model.model_dump(mode='json')
-            # Add the user_id to the dictionary
             data['user_id'] = user_id
             rows_to_insert.append(data)
         
-        # Insert all rows in a single transaction for efficiency
         cursor.executemany("""
             INSERT INTO feedback_reports (
                 user_id, interview_id, timestamp, interview_type, question_number,
@@ -57,7 +53,7 @@ def get_all_interviews_for_user(user_id: int):
     conn = None
     try:
         conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row # This allows us to access columns by name
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
         cursor.execute("""

@@ -8,7 +8,6 @@ def get_interview_response(gemma_model, process_func, current_session_log, promp
     """
     print(">> Gemma is thinking...")
     
-    # We now pass the uniquely named variable to the formatting function.
     prompt = prompt_template.format(
         history=format_history_for_prompt(current_session_log)
     )
@@ -24,7 +23,6 @@ def format_history_for_prompt(history):
     if not history: return "The conversation has not started yet."
     formatted_string = ""
     for message in history:
-        # Use a more descriptive role name for the prompt
         role = "Candidate" if message['role'] == 'user' else "Interviewer (Gemma)"
         formatted_string += f"{role}:\n{message['content']}\n\n"
     return formatted_string

@@ -1,5 +1,3 @@
-# interview_flow_manager.py
-
 from gemma_logic import format_history_for_prompt
 import prompts
 
@@ -27,7 +25,7 @@ def should_end_interview(conversation_history, interview_type, current_turn):
     MODIFIED: Simplified to not need topics_covered directly,
     as stagnation is the more critical check for this problem.
     """
-    if current_turn < 4:  # Ensure a minimum of 3 questions are asked
+    if current_turn < 4:
         return False, "Minimum turns not reached"
     
     if has_natural_conclusion_indicators(conversation_history):
@@ -48,17 +46,14 @@ def is_conversation_stagnating(conversation_history):
     """
     if len(conversation_history) < 4: return False
     
-    # Get the last two messages from the assistant
     assistant_msgs = [msg['content'] for msg in conversation_history if msg['role'] == 'assistant']
     if len(assistant_msgs) < 2: return False
     
     msg1_words = set(assistant_msgs[-2].lower().split())
     msg2_words = set(assistant_msgs[-1].lower().split())
     
-    # Avoid division by zero if a message is empty
     if not msg1_words or not msg2_words: return False
     
-    # Calculate Jaccard similarity
     intersection_len = len(msg1_words.intersection(msg2_words))
     union_len = len(msg1_words.union(msg2_words))
     
@@ -66,7 +61,6 @@ def is_conversation_stagnating(conversation_history):
 
     similarity = intersection_len / union_len
     
-    # If the similarity is very high (e.g., > 60%), we are stagnating.
     if similarity > 0.6:
         print(f"DEBUG: Stagnation detected! Similarity: {similarity:.2f}")
         return True

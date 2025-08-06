@@ -32,7 +32,6 @@ import sys
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
         base_path = os.path.abspath(".")
@@ -258,7 +257,6 @@ class App(ctk.CTk):
             self.transition_to_main_app()
 
     def logout_and_return_to_welcome(self):
-        # --- NEW: Signal the background listener to stop ---
         if self.stop_listening_event:
             print("DEBUG: Setting stop event for listener thread.")
             self.stop_listening_event.set()
@@ -292,7 +290,6 @@ class App(ctk.CTk):
                 last_screen = self.current_user['preferences'].get('last_screen', 'interview_screen')
                 self.current_frame.show_screen(last_screen)
                 
-                # --- MODIFIED: Start the initialization thread without arguments ---
                 threading.Thread(target=self.initialize_models_and_listen, daemon=True).start()
 
     def speak(self, text):
@@ -318,10 +315,8 @@ class App(ctk.CTk):
         audio_thread.start()
         audio_thread.join()
 
-    # --- NEW: Centralized audio player ---
     def play_audio(self, audio_key: str):
         """Plays an audio file by its logical name and logs the action."""
-        # --- NEW: Debugging Logs ---
         print(f"AUDIO_PLAYER: Attempting to play '{audio_key}'...")
         try:
             path = AUDIO_PATHS[audio_key]
@@ -332,7 +327,6 @@ class App(ctk.CTk):
             print(f"AUDIO_PLAYER_ERROR: Audio key '{audio_key}' not found in AUDIO_PATHS.")
         except FileNotFoundError:
             print(f"AUDIO_PLAYER_ERROR: File not found at path: {path}")
-            # Fallback to prevent silence
             self.speak("A required audio file could not be found.")
         except Exception as e:
             print(f"AUDIO_PLAYER_ERROR: Could not play '{audio_key}'. Reason: {e}")
@@ -357,16 +351,13 @@ class App(ctk.CTk):
         if prompt_text:
             self.speak(prompt_text)
 
-        # --- Let's define our timing parameters clearly here ---
         pause_duration = 1.5  
         max_record_time = 300
         initial_timeout = 30
 
-        # --- For your visibility, let's print the settings we're using ---
         print(f"DEBUG: Listener settings: pause_threshold={pause_duration}s, phrase_limit={max_record_time}s")
-        # --------------------------------------------------------------------
 
-        self.play_audio("beep") # Use the new audio manager
+        self.play_audio("beep")
         self.update_status("Listening...")
 
         try:
@@ -424,14 +415,11 @@ class App(ctk.CTk):
         if not self.gemma_model:
             self.update_status("Loading Gemma AI...")
             print("DEBUG: Loading Gemma (Llama.cpp) model...")
-            # --- THIS IS THE CRITICAL CHANGE ---
-            # We force n_gpu_layers=0 to disable GPU usage, which is a common
-            # point of failure in compiled apps.
             self.gemma_model = Llama(
                 model_path=MODEL_PATH,
                 n_ctx=2048,
-                n_gpu_layers=0,  # Force CPU
-                verbose=True     # Get more output
+                n_gpu_layers=0,
+                verbose=True
             )
             print("DEBUG: Gemma (Llama.cpp) model LOADED.")
 
@@ -466,7 +454,6 @@ class App(ctk.CTk):
 
         self.update_status("Ready for commands.")
         
-        # --- NEW: Create and pass the stop_event to the thread ---
         self.stop_listening_event = threading.Event()
         threading.Thread(
             target=self.background_listener, 
@@ -476,18 +463,16 @@ class App(ctk.CTk):
 
     def enter_feedback_mode(self):
         """Stops the main listener and starts the dedicated feedback listener."""
-        if self.in_feedback_mode: # Prevent this from running twice
+        if self.in_feedback_mode:
             return
         print("DEBUG: Entering Feedback Mode.")
         self.in_feedback_mode = True
 
-        # Stop the main navigation listener
         if self.stop_listening_event:
             print("DEBUG: Stopping main navigation listener.")
             self.stop_listening_event.set()
             self.stop_listening_event = None
 
-        # Start the new feedback listener in a separate thread
         print("DEBUG: Starting feedback navigation listener.")
         self.feedback_listener_stop_event = threading.Event()
         threading.Thread(
@@ -520,13 +505,11 @@ class App(ctk.CTk):
         print("DEBUG: Exiting Feedback Mode.")
         self.in_feedback_mode = False
 
-        # Stop the feedback listener
         if self.feedback_listener_stop_event:
             print("DEBUG: Stopping feedback navigation listener.")
             self.feedback_listener_stop_event.set()
             self.feedback_listener_stop_event = None
 
-        # Restart the main navigation listener so the user can give commands again
         print("DEBUG: Restarting main navigation listener.")
         self.update_status("Ready for commands.")
         threading.Thread(
@@ -561,7 +544,6 @@ class App(ctk.CTk):
             self.speak(announcement)
             time.sleep(0.5)
 
-        # --- SELECTION LOOP ---
         while not stop_event.is_set():
             self.play_audio("feedback_prompt_for_selection")
             user_choice_text = self.listen_after_prompt() # Re-uses your existing robust listener
@@ -570,7 +552,6 @@ class App(ctk.CTk):
                 self.speak("I'm sorry, I didn't catch that. Please say which report you'd like.")
                 continue
 
-            # Call the Ordinal Selector AI
             list_len = len(self.current_report_list)
             prompt = AI_PERSONAS["ORDINAL_SELECTOR"].format(
                 list_length=list_len,
@@ -583,11 +564,9 @@ class App(ctk.CTk):
             try:
                 selected_index = int(index_str)
                 if 0 <= selected_index < list_len:
-                    # Valid index found!
                     selected_report = self.current_report_list[selected_index]
                     interview_id_to_discuss = selected_report['interview_id']
 
-                    # Confirm with the user
                     date_obj = datetime.fromisoformat(selected_report['timestamp'])
                     date_str = date_obj.strftime("%B %dth")
                     confirmation_prompt = f"Okay, discussing the {selected_report['interview_type']} interview from {date_str}. Is that correct?"
@@ -645,10 +624,6 @@ class App(ctk.CTk):
 
         interviews = feedback_manager.get_all_interviews_for_user(self.current_user['id'])
 
-        # if not interviews:
-        #     ctk.CTkLabel(self.current_frame.interview_list_frame, text="No reports found.").pack(pady=10)
-        #     return
-        # self.play_audio("feedback_list_reports_intro")
         for interview in interviews:
             date_str = interview['timestamp'].split(" ")[0]
             button_text = f"{interview['interview_type']}\n{date_str}"
@@ -660,14 +635,12 @@ class App(ctk.CTk):
             )
             button.pack(fill="x", padx=5, pady=5)
 
-    # --- Function to display the details of a selected report ---
     def display_feedback_report(self, interview_id: str):
         report_details = feedback_manager.get_report_details_by_interview_id(interview_id)
 
         if not report_details:
             formatted_text = "Error: Could not retrieve report details."
         else:
-            # Format the details into a nice string
             header = f"Report for {report_details[0]['interview_type']} Interview\n"
             header += f"Date: {report_details[0]['timestamp']}\n"
             header += "="*50 + "\n\n"
@@ -704,26 +677,22 @@ class App(ctk.CTk):
             print("Cannot start feedback session while another process is active.")
             return
 
-        # 1. Get the full report details from the database
         report_details = feedback_manager.get_report_details_by_interview_id(interview_id)
         if not report_details:
             self.speak("I'm sorry, I couldn't retrieve the details for that report.")
             self.after(0, self.exit_feedback_mode_if_active)
             return
 
-        # 2. Format the report into a single string for the AI
         header = f"Report for {report_details[0]['interview_type']} Interview from {report_details[0]['timestamp']}\n\n"
         q_and_a_text = "\n---\n".join(
             [f"Question {item['question_number']}: {item['question_text']}\nAnswer: {item['answer_text']}\nSTAR Score: {item.get('star_score', 'N/A')}, Reason: {item.get('star_reason', 'N/A')}" for item in report_details]
         )
         full_report_text = header + q_and_a_text
 
-        # 3. Set the application state and lock the UI
         self.app_state = "FEEDBACK_QA"
-        self.interview_in_progress = True # Reuse flag to prevent other actions
+        self.interview_in_progress = True
         print(f"DEBUG: App state changed to {self.app_state}")
 
-        # 4. Play the introductory audio and start the feedback thread
         self.play_audio("feedback_discussion_starting")
         threading.Thread(target=self._feedback_thread, args=(full_report_text,), daemon=True).start()
 
@@ -733,14 +702,12 @@ class App(ctk.CTk):
         MODIFIED: This version has a simplified and corrected prompt structure
         to prevent AI confusion and restore correct conversational behavior.
         """
-        # --- Setup Phase (Unchanged) ---
         self.after(0, lambda: self.current_frame.discuss_button.configure(state="disabled"))
         self.after(0, lambda: self.current_frame.return_button.configure(state="disabled"))
         self.update_status("Starting Feedback...")
 
         feedback_history = []
         
-        # --- First Turn: Initial Summary (Unchanged, this part works well) ---
         initial_prompt = f"""
         [INST]
         {AI_PERSONAS['FEEDBACK_COACH']}
@@ -751,20 +718,16 @@ class App(ctk.CTk):
         Now, provide your initial summary of what went well and what can be improved.
         [/INST]
         """
-        # We will use one consistent variable for the AI's response
         ai_response = self._process_gemma_response(initial_prompt, max_tokens=300)
         feedback_history.append({"role": "assistant", "content": ai_response})
         
-        # --- Main Q&A Loop (CORRECTED) ---
         while True:
-            # The last AI response is spoken to prompt the user
             user_question = self.listen_after_prompt(prompt_text=self._sanitize_for_speech(ai_response))
             
             if not user_question:
                 self.speak("I'm sorry, I didn't catch that. Could you ask your question again?")
                 continue
 
-            # First, check for exit intent using our specialist
             exit_check_prompt = f"""[INST]{AI_PERSONAS['EXIT_DETECTOR']}
             User says: "{user_question}"[/INST]"""
             exit_decision = self._process_gemma_response(exit_check_prompt, max_tokens=10)
@@ -774,12 +737,9 @@ class App(ctk.CTk):
                 self.play_audio("feedback_session_ending")
                 break
 
-            # If not exiting, add the user's question to the history
             feedback_history.append({"role": "user", "content": user_question})
             history_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in feedback_history])
             
-            # --- THIS IS THE SIMPLIFIED AND CORRECTED PROMPT ---
-            # It clearly restates the persona and the goal in every turn.
             qa_prompt = f"""
             [INST]
             You are Gemma, the helpful Feedback Coach.
@@ -797,7 +757,6 @@ class App(ctk.CTk):
             ai_response = self._process_gemma_response(qa_prompt, max_tokens=300)
             feedback_history.append({"role": "assistant", "content": ai_response})
 
-        # --- Teardown Phase (Unchanged) ---
         self.after(0, lambda: self.current_frame.discuss_button.configure(state="normal"))
         self.after(0, lambda: self.current_frame.return_button.configure(state="normal"))
         self.app_state = "NAVIGATION"
@@ -810,7 +769,6 @@ class App(ctk.CTk):
         with self.microphone as source:
             self.recognizer.adjust_for_ambient_noise(source, duration=1)
         
-        # --- NEW: Initialize turn counter ---
         turn_counter = 0
         
         user_input = "" 
@@ -820,17 +778,13 @@ class App(ctk.CTk):
                 self.conversation_history.append({"role": "user", "content": user_input})
                 db.add_message_to_history(self.current_user['id'], "user", user_input)
                 
-                # --- NEW: Increment counter after a valid user response ---
                 turn_counter += 1
 
-            # --- NEW: Check if the turn limit has been reached ---
             if turn_counter >= MAX_ONBOARDING_TURNS:
                 print(f"DEBUG: Reached max turns ({turn_counter}). Forcing end of onboarding.")
-                # We use the [END_ONBOARDING] command to trigger the existing summarization flow
                 self.execute_command("[END_ONBOARDING]")
-                break # Exit the loop
+                break
 
-            # Build the prompt with proper multi-turn formatting
             prompt_for_gemma = f"[INST] {AI_PERSONAS[self.current_persona]} [/INST]"
             if not self.conversation_history:
                  prompt_for_gemma += " Assistant:"
@@ -844,7 +798,6 @@ class App(ctk.CTk):
             self.update_status("Gemma is thinking...")
             ai_response = self._process_gemma_response(prompt_for_gemma)
 
-            # The AI-driven [END_ONBOARDING] is now a fallback, not the primary method
             if "[END_ONBOARDING]" in ai_response:
                 self.execute_command("[END_ONBOARDING]")
                 break
@@ -935,8 +888,6 @@ class App(ctk.CTk):
     def _interview_thread(self, interview_type):
         """Manages the entire interview flow, from start to analysis."""
         
-        # --- Setup Phase ---
-        # 1. Set a LONG pause threshold suitable for interview answers
         self.recognizer.pause_threshold = 2.5
         print(f"DEBUG: Mic pause_threshold set to {self.recognizer.pause_threshold} for interview.")
 
@@ -951,7 +902,6 @@ class App(ctk.CTk):
         
         turn_count = 0
         
-        # --- Using a 'while True' loop managed by our flow controller ---
         while True:
             turn_count += 1
             print(f"\n--- Turn {turn_count} ---")
@@ -960,11 +910,10 @@ class App(ctk.CTk):
 
             ai_response = gemma_logic.get_interview_response(self.gemma_model, self._process_gemma_response, interview_history, prompt_template)
             
-            # Sanitize response from potential markdown
             if ai_response.startswith("```"):
                 ai_response = ai_response.strip("` \n")
 
-            if not ai_response: # Handle case where model returns empty string
+            if not ai_response:
                 print("WARNING: Model returned empty response. Attempting to conclude.")
                 self.speak("It seems we've reached a good stopping point. Thank you for your time.")
                 break
@@ -973,7 +922,6 @@ class App(ctk.CTk):
             self.after(0, self._add_message_to_chat_ui, "assistant", ai_response)
             interview_history.append({"role": "assistant", "content": ai_response})
             
-            # Check for natural conclusion phrases from the AI
             conclusion_phrases = ["thank you for your time", "we'll be in touch", "end the simulation", "conclude our discussion"]
             if any(phrase in ai_response.lower() for phrase in conclusion_phrases):
                 self.speak(self._sanitize_for_speech(ai_response))
@@ -985,21 +933,20 @@ class App(ctk.CTk):
 
             if not user_answer:
                 self.play_audio("interview_no_input_detected")
-                interview_history.pop() # Remove the last AI question
-                turn_count -= 1 # Don't count this as a turn
+                interview_history.pop()
+                turn_count -= 1
                 continue
             
             self.after(0, self._add_message_to_chat_ui, "user", user_answer)
             interview_history.append({"role": "user", "content": user_answer})
             
-            # --- USE THE FLOW MANAGER TO CHECK IF WE SHOULD END ---
             should_end, reason = interview_flow_manager.should_end_interview(interview_history, interview_type, turn_count)
             if should_end:
                 print(f"INFO: Ending interview. Reason: {reason}")
                 self.speak("Okay, that seems like a good place to stop. Thank you.")
                 break
 
-            if turn_count >= 12: # Final safety break
+            if turn_count >= 12:
                 print("INFO: Ending interview due to reaching max turn limit.")
                 self.speak("We've covered a lot today, so let's wrap up there. Thank you.")
                 break
@@ -1016,8 +963,6 @@ class App(ctk.CTk):
         else:
             self.speak("There was an issue generating the analysis, so no report was saved.")
 
-        # --- Teardown Phase ---
-        # 2. Restore the SHORT pause threshold for command listening
         self.recognizer.pause_threshold = 1.0 
         print(f"DEBUG: Mic pause_threshold restored to {self.recognizer.pause_threshold} for commands.")
 
@@ -1030,14 +975,11 @@ class App(ctk.CTk):
         
         self.interview_in_progress = False
 
-        # --- Automatically switch to the feedback screen ---
         if analysis_results:
             new_interview_id = analysis_results[0].interview_id
             self.after(0, self.current_frame.show_screen, "feedback_screen")
             self.after(200, self.display_feedback_report, str(new_interview_id))
-        # --------------------------------------------------------
 
-        # This is now the ONLY call to restart the listener. It is correct.
         self.stop_listening_event = threading.Event()
         threading.Thread(target=self.background_listener, args=(self.stop_listening_event,), daemon=True).start()
 
@@ -1097,7 +1039,6 @@ class App(ctk.CTk):
             updated_prefs['onboarding_complete'] = True
             db.update_user_preferences(self.current_user['id'], updated_prefs)
 
-        # Final hand-off
         self.app_state = "NAVIGATION"
         self.current_persona = "NAVIGATION_ASSISTANT"
         self.update_status("Profile setup complete!")

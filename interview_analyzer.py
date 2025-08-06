@@ -1,4 +1,3 @@
-# import config
 import prompts
 from data_models import InterviewDataRow
 from datetime import datetime
