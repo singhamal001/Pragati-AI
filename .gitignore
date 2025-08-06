@@ -6,3 +6,7 @@ dist/
 VoiceNavigator/
 *.safetensors
 indri-0.1-124m-tts/
+app.build/
+app.dist/
+working_app.dist/
+working_app.build/
