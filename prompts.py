@@ -125,7 +125,6 @@ USER'S STATEMENT:
 "{last_user_answer}"
 """
 
-# New prompt for generating a conclusion when the interview is force-ended
 GENERATE_CONCLUSION_PROMPT = """
 Based on this {interview_type} interview conversation, generate a brief, natural conclusion 
 that Gemma would say to wrap up the interview professionally. Keep it under 50 words.
