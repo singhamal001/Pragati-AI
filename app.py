@@ -15,6 +15,7 @@ import sounddevice as sd
 import numpy as np
 from pydub import AudioSegment
 from pydub.playback import play
+import time
 
 import prompts
 import gemma_logic
@@ -309,6 +310,7 @@ class App(ctk.CTk):
                         stream.write(audio_chunk.audio_int16_array)
             except Exception as e:
                 print(f"Piper TTS playback error: {e}")
+                print("DEBUG: The speak() function failed. This is likely an audio device conflict.")
             finally:
                 self._hide_speaking_indicator()
         
@@ -415,14 +417,30 @@ class App(ctk.CTk):
     def _load_models(self):
         if not self.whisper_model:
             self.update_status("Loading speech model...")
-            whisper_model_path = resource_path("./model/base.en.pt")
-            self.whisper_model = whisper.load_model(whisper_model_path)
+            print("DEBUG: Loading Whisper model...")
+            self.whisper_model = whisper.load_model("base.en")
+            print("DEBUG: Whisper model LOADED.")
+
         if not self.gemma_model:
             self.update_status("Loading Gemma AI...")
-            self.gemma_model = Llama(model_path=MODEL_PATH, n_ctx=2048, verbose=False)
+            print("DEBUG: Loading Gemma (Llama.cpp) model...")
+            # --- THIS IS THE CRITICAL CHANGE ---
+            # We force n_gpu_layers=0 to disable GPU usage, which is a common
+            # point of failure in compiled apps.
+            self.gemma_model = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=2048,
+                n_gpu_layers=0,  # Force CPU
+                verbose=True     # Get more output
+            )
+            print("DEBUG: Gemma (Llama.cpp) model LOADED.")
+
         if not self.piper_voice:
             self.update_status("Loading voice model...")
+            print("DEBUG: Loading Piper model...")
             self.piper_voice = PiperVoice.load(PIPER_MODEL_PATH)
+            print("DEBUG: Piper model LOADED.")
+
 
     def initialize_models_and_start_onboarding(self):
         self._load_models()
@@ -432,6 +450,8 @@ class App(ctk.CTk):
         
         self.play_audio("instructions_part1")
         self.play_audio("instructions_part2")
+
+        time.sleep(0.5)
         
         self.onboarding_listener()
 
@@ -509,7 +529,6 @@ class App(ctk.CTk):
         # Restart the main navigation listener so the user can give commands again
         print("DEBUG: Restarting main navigation listener.")
         self.update_status("Ready for commands.")
-        self.stop_listening_event = threading.Event()
         threading.Thread(
             target=self.background_listener,
             args=(self.stop_listening_event,),
@@ -784,9 +803,7 @@ class App(ctk.CTk):
         self.app_state = "NAVIGATION"
         self.update_status("Ready for commands.")
         self.interview_in_progress = False
-        self.listener_stop_flag = threading.Event()
         self.exit_feedback_mode_if_active()
-        threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
 
     def onboarding_listener(self):
         """Manages the conversational onboarding flow with a fixed number of turns."""
@@ -907,8 +924,9 @@ class App(ctk.CTk):
 
         self._clear_chat_ui()
 
-        if self.listener_stop_flag:
-            self.listener_stop_flag.set()
+        if self.stop_listening_event:
+            self.stop_listening_event.set()
+            self.stop_listening_event = None
 
         self.interview_in_progress = True
         threading.Thread(target=self._interview_thread, args=(interview_type,), daemon=True).start()
@@ -1020,8 +1038,9 @@ class App(ctk.CTk):
         # --------------------------------------------------------
 
         # This is now the ONLY call to restart the listener. It is correct.
-        self.listener_stop_flag = threading.Event()
-        threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
+        self.stop_listening_event = threading.Event()
+        threading.Thread(target=self.background_listener, args=(self.stop_listening_event,), daemon=True).start()
+
 
 
     def execute_command(self, command: str):
@@ -1085,8 +1104,9 @@ class App(ctk.CTk):
         
         self.play_audio("onboarding_complete_transition")
         
-        self.listener_stop_flag = threading.Event()
-        threading.Thread(target=self.background_listener, args=(self.listener_stop_flag,), daemon=True).start()
+        self.stop_listening_event = threading.Event()
+        threading.Thread(target=self.background_listener, args=(self.stop_listening_event,), daemon=True).start()
+
 
 if __name__ == "__main__":
     print("Application starting up...")

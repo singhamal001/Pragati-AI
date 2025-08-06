@@ -206,8 +206,7 @@ def remove_last_message(user_id):
         )
         last_message = cursor.fetchone()
         if last_message:
-            # Delete that specific message
-            cursor.execute("DELETE FROM conversation_history WHERE id = ?", (last_message,))
+            cursor.execute("DELETE FROM conversation_history WHERE id = ?", last_message)
             conn.commit()
     except sqlite3.Error as e:
         print(f"Database error removing last message: {e}")
