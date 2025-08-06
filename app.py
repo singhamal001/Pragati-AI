@@ -193,6 +193,7 @@ class App(ctk.CTk):
         self.current_persona = None
         self.listener_stop_flag = None
         self.interview_in_progress = False
+        self.background_listener_thread = None
 
         self.feedback_listener_stop_event = None
         self.in_feedback_mode = False
@@ -261,7 +262,14 @@ class App(ctk.CTk):
             print("DEBUG: Setting stop event for listener thread.")
             self.stop_listening_event.set()
             self.stop_listening_event = None
+        
+        if self.background_listener_thread and self.background_listener_thread.is_alive():
+            print("DEBUG: Waiting for background listener to terminate...")
+            self.background_listener_thread.join(timeout=2)
+            print("DEBUG: Background listener terminated.")
 
+        self.stop_listening_event = None
+        self.background_listener_thread = None
         self.play_audio("logout_confirmation")
         self.app_state = None
         self.current_user = None
@@ -455,11 +463,13 @@ class App(ctk.CTk):
         self.update_status("Ready for commands.")
         
         self.stop_listening_event = threading.Event()
-        threading.Thread(
-            target=self.background_listener, 
-            args=(self.stop_listening_event,), 
+        self.background_listener_thread = threading.Thread(
+            target=self.background_listener,
+            args=(self.stop_listening_event,),
             daemon=True
-        ).start()
+        )
+        self.background_listener_thread.start()
+
 
     def enter_feedback_mode(self):
         """Stops the main listener and starts the dedicated feedback listener."""
@@ -512,11 +522,13 @@ class App(ctk.CTk):
 
         print("DEBUG: Restarting main navigation listener.")
         self.update_status("Ready for commands.")
-        threading.Thread(
+        self.background_listener_thread = threading.Thread(
             target=self.background_listener,
             args=(self.stop_listening_event,),
             daemon=True
-        ).start()
+        )
+        self.background_listener_thread.start()
+
 
     def feedback_navigation_listener(self, stop_event):
         """
